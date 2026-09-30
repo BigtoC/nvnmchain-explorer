@@ -1,6 +1,6 @@
 //! SQLite storage layer, mirroring `app/database.py` + `app/models.py`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use crate::models::{
     AnchoringEvent, Block, BlockBundle, TokenMetadata, Transaction, TransferEvent,
 };
+use crate::summary::ZERO_ADDRESS;
 
 pub type Db = Arc<Mutex<Connection>>;
 
@@ -323,6 +324,14 @@ pub fn init_db(path: &str) -> Result<Connection> {
             PRIMARY KEY (token_addr, holder_addr)
         );
         CREATE INDEX IF NOT EXISTS idx_tb_holder ON token_balances(holder_addr);
+
+        -- Each seen holder's balance at genesis, zero included: no event carries it.
+        CREATE TABLE IF NOT EXISTS genesis_balances (
+            token_addr TEXT NOT NULL,
+            holder_addr TEXT NOT NULL,
+            balance TEXT NOT NULL,
+            PRIMARY KEY (token_addr, holder_addr)
+        );
 
         -- Function signatures for selectors no built-in ABI declares, as
         -- answered by the configured directory. An empty `signature` is a
@@ -1193,6 +1202,10 @@ fn apply_transfer_balances(conn: &Connection, transfers: &[&TransferEvent]) -> R
             + adjust_balance(conn, &t.token_addr, &t.to_addr, &amount)?;
         *moved.entry(t.token_addr.as_str()).or_default() += holders;
     }
+    add_to_holder_counts(conn, moved)
+}
+
+fn add_to_holder_counts(conn: &Connection, moved: HashMap<&str, i64>) -> Result<()> {
     for (token, by) in moved {
         if by != 0 {
             exec_cached(
@@ -1202,6 +1215,67 @@ fn apply_transfer_balances(conn: &Connection, transfers: &[&TransferEvent]) -> R
             )?;
         }
     }
+    Ok(())
+}
+
+const GENESIS_CURSOR: &str = "genesis_balances_cursor";
+
+/// A token and one of its holders.
+pub type Holder = (String, String);
+
+/// The holders in the next `limit` transfers past the cursor that have no genesis
+/// balance yet, and the id the cursor moves to; `None` once caught up.
+pub fn holders_without_genesis_balance(db: &Db, limit: i64) -> Result<Option<(i64, Vec<Holder>)>> {
+    let cursor: i64 = get_kv(db, GENESIS_CURSOR)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let conn = lock(db);
+    let mut transfers = conn.prepare_cached(
+        "SELECT id, token_addr, from_addr, to_addr FROM transfer_events
+         WHERE id > ?1 ORDER BY id LIMIT ?2",
+    )?;
+    let mut stored = conn.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM genesis_balances WHERE token_addr=?1 AND holder_addr=?2)",
+    )?;
+    let mut last = cursor;
+    let mut holders = Vec::new();
+    let mut seen = HashSet::new();
+    let mut rows = transfers.query(params![cursor, limit])?;
+    while let Some(r) = rows.next()? {
+        last = r.get(0)?;
+        let token = addr_from_value(r.get_ref(1)?);
+        for holder in [2, 3].map(|i| r.get_ref(i).map(addr_from_value)) {
+            let holder = (token.clone(), holder?);
+            if holder.1 != ZERO_ADDRESS
+                && seen.insert(holder.clone())
+                && !stored.query_row(params![holder.0, holder.1], |r| r.get::<_, bool>(0))?
+            {
+                holders.push(holder);
+            }
+        }
+    }
+    Ok((last != cursor).then_some((last, holders)))
+}
+
+/// Store the balances not stored yet, add them to their holders', and move the cursor.
+pub fn save_genesis_balances(db: &Db, balances: &[(Holder, String)], cursor: i64) -> Result<()> {
+    let mut conn = lock(db);
+    let txn = conn.transaction()?;
+    let mut moved: HashMap<&str, i64> = HashMap::new();
+    for ((token, holder), balance) in balances {
+        let inserted = exec_cached(
+            &txn,
+            "INSERT OR IGNORE INTO genesis_balances (token_addr, holder_addr, balance) VALUES (?1, ?2, ?3)",
+            params![token, holder, balance],
+        )?;
+        if inserted != 0 {
+            *moved.entry(token).or_default() +=
+                adjust_balance(&txn, token, holder, &bigint(balance))?;
+        }
+    }
+    add_to_holder_counts(&txn, moved)?;
+    set_kv(&txn, GENESIS_CURSOR, &cursor.to_string())?;
+    txn.commit()?;
     Ok(())
 }
 
@@ -1240,7 +1314,7 @@ pub fn rebuild_token_balances(conn: &Connection) -> Result<()> {
     // so a crash halfway would leave partial ones it takes for complete.
     let txn = conn.unchecked_transaction()?;
     txn.execute("DELETE FROM token_balances", [])?;
-    let mut touched: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut touched: HashSet<String> = HashSet::new();
     let mut n = 0usize;
     {
         let mut stmt = txn.prepare(
@@ -1261,6 +1335,19 @@ pub fn rebuild_token_balances(conn: &Connection) -> Result<()> {
             adjust_balance(&txn, &token, &to, &amount)?;
             touched.insert(token);
             n += 1;
+        }
+        let mut stmt =
+            txn.prepare("SELECT token_addr, holder_addr, balance FROM genesis_balances")?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let token: String = r.get(0)?;
+            adjust_balance(
+                &txn,
+                &token,
+                &r.get::<_, String>(1)?,
+                &bigint(&r.get::<_, String>(2)?),
+            )?;
+            touched.insert(token);
         }
     }
     for token in touched {

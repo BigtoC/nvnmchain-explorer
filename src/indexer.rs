@@ -26,6 +26,7 @@ use crate::decoder::{checksum_address, decode_event, DecodedEvent};
 use crate::models::{AnchoringEvent, BlockBundle, Transaction, TransferEvent};
 use crate::parse::{parse_block, parse_transaction};
 use crate::rpc::ChainRpc;
+use crate::summary::ZERO_ADDRESS;
 use crate::tokens::{fetch_token_metadata, has_control_chars};
 
 /// How many blocks share one JSON-RPC HTTP request. Sixteen empty blocks
@@ -266,6 +267,26 @@ async fn fetch_block_bundles(
     Ok(bundles)
 }
 
+/// Tokens with no metadata row yet, and tokens a mint or burn here moved the supply of.
+fn tokens_to_fetch(bundles: &[BlockBundle], known: &HashSet<String>) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for bundle in bundles {
+        out.extend(
+            bundle_token_addrs(bundle)
+                .filter(|addr| !known.contains(*addr))
+                .map(String::from),
+        );
+        out.extend(
+            bundle
+                .transfers
+                .iter()
+                .filter(|t| t.from_addr == ZERO_ADDRESS || t.to_addr == ZERO_ADDRESS)
+                .map(|t| t.token_addr.clone()),
+        );
+    }
+    out
+}
+
 fn bundle_token_addrs(bundle: &BlockBundle) -> impl Iterator<Item = &str> {
     bundle
         .transfers
@@ -279,23 +300,16 @@ async fn attach_token_metadata(
     known_tokens: &Arc<Mutex<HashSet<String>>>,
     bundles: &mut [BlockBundle],
 ) {
-    let mut unseen = HashSet::new();
-    {
-        let known = known_tokens.lock().unwrap_or_else(|e| e.into_inner());
-        for bundle in bundles.iter() {
-            for addr in bundle_token_addrs(bundle) {
-                if !known.contains(addr) {
-                    unseen.insert(addr.to_string());
-                }
-            }
-        }
-    }
-    if unseen.is_empty() {
+    let wanted = tokens_to_fetch(
+        bundles,
+        &known_tokens.lock().unwrap_or_else(|e| e.into_inner()),
+    );
+    if wanted.is_empty() {
         return;
     }
 
     let mut set = tokio::task::JoinSet::new();
-    for addr in unseen {
+    for addr in wanted {
         let rpc = rpc.clone();
         set.spawn(async move {
             let meta = fetch_token_metadata(&rpc, &addr).await;
@@ -982,6 +996,13 @@ pub async fn run_forever(
         .await
     });
 
+    tokio::spawn(genesis_loop(
+        rpc.clone(),
+        db.clone(),
+        stats_interval,
+        shutdown.clone(),
+    ));
+
     // Seed the token-metadata cache and repair balances on legacy databases.
     let known_tokens = Arc::new(Mutex::new(
         db::get_all_token_addresses(&db).into_iter().collect(),
@@ -1075,6 +1096,34 @@ pub async fn run_forever(
 // ---------------------------------------------------------------------------
 // Precomputed network stats
 // ---------------------------------------------------------------------------
+
+/// Add each seen holder's balance at block 0, once: no Transfer carries what
+/// genesis gave it, so a funded holder reads negative from its first send.
+async fn genesis_loop(
+    rpc: ChainRpc,
+    db: Db,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        if let Err(e) = add_genesis_balances(&rpc, &db).await {
+            warn!("genesis balances: {e:#}");
+        }
+        if sleep_or_shutdown(&mut shutdown, interval).await {
+            break;
+        }
+    }
+}
+
+/// The transfers indexed since the last pass, a page at a time.
+async fn add_genesis_balances(rpc: &ChainRpc, db: &Db) -> Result<()> {
+    while let Some((cursor, holders)) = db::holders_without_genesis_balance(db, 1000)? {
+        let balances = crate::tokens::balances_at_genesis(rpc, &holders).await?;
+        let rows: Vec<_> = holders.into_iter().zip(balances).collect();
+        db::save_genesis_balances(db, &rows, cursor)?;
+    }
+    Ok(())
+}
 
 /// Recompute the home-page stats blob into the `kv` table every interval so
 /// the web layer never has to scan history at request time.
@@ -1211,6 +1260,39 @@ mod tests {
 
     fn chunks(from: u64, to: u64, batch: u64) -> Vec<RangeInclusive<u64>> {
         block_chunks(from, to, batch).collect()
+    }
+
+    /// A mint or burn moves a known token's supply, so its row is read again.
+    #[test]
+    fn supply_is_reread_after_a_mint_or_burn() {
+        let (minted, burned, moved) = (
+            "0x20C0000000000000000000000000000000000001",
+            "0x20C0000000000000000000000000000000000002",
+            "0x20C0000000000000000000000000000000000003",
+        );
+        let holder = "0x1111111111111111111111111111111111111111";
+        let transfer = |token: &str, from: &str, to: &str| TransferEvent {
+            id: 0,
+            tx_hash: String::new(),
+            block_number: 1,
+            log_index: 0,
+            token_addr: token.into(),
+            from_addr: from.into(),
+            to_addr: to.into(),
+            amount: "1".into(),
+            timestamp: 0,
+            created_at: 0,
+        };
+        let mut bundle = assemble_bundle(&json!({"number": "0x1"}), None);
+        bundle.transfers = vec![
+            transfer(minted, ZERO_ADDRESS, holder),
+            transfer(burned, holder, ZERO_ADDRESS),
+            transfer(moved, holder, "0x2222222222222222222222222222222222222222"),
+        ];
+        let known = [minted, burned, moved].map(String::from).into();
+
+        let wanted = tokens_to_fetch(&[bundle], &known);
+        assert_eq!(wanted, [minted, burned].map(String::from).into());
     }
 
     #[test]

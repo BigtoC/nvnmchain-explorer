@@ -27,7 +27,7 @@ fn truncate(value: &str) -> String {
     truncate_hash(value, 4, 4)
 }
 
-const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
+pub(crate) const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
 /// What the summary needs to know about a token to spell an amount.
 #[derive(Debug, Clone, Default)]
