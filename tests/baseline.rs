@@ -31,6 +31,7 @@ use nvnmchain_explorer::db::{self, Db};
 use nvnmchain_explorer::indexer::fetch_block_bundle;
 use nvnmchain_explorer::models::BlockBundle;
 use nvnmchain_explorer::rpc::ChainRpc;
+use nvnmchain_explorer::tokens::balances_at_genesis;
 use rusqlite::types::Value as Sql;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
@@ -185,7 +186,9 @@ async fn fetch(rpc: &ChainRpc, number: u64) -> anyhow::Result<BlockBundle> {
 }
 
 /// Index `runs` into `db` the way a baseline is built: fetched concurrently,
-/// written in ascending block order.
+/// written in ascending block order, then the genesis pass the explorer runs
+/// alongside indexing, which fills `genesis_balances` and adds each holder's
+/// block-0 balance to `token_balances`.
 async fn reindex(rpc: &ChainRpc, db: &Db, runs: &[RangeInclusive<u64>]) {
     let numbers: Vec<u64> = runs.iter().cloned().flatten().collect();
     let mut bundles = stream::iter(numbers)
@@ -195,6 +198,28 @@ async fn reindex(rpc: &ChainRpc, db: &Db, runs: &[RangeInclusive<u64>]) {
     while let Some(chunk) = bundles.next().await {
         let chunk = chunk.map_err(|e| e.1).expect("fetch");
         db::save_block_bundles(db, &chunk).expect("save");
+    }
+    add_genesis_balances(rpc, db).await;
+}
+
+/// `indexer::add_genesis_balances`, which is private: page through the
+/// transfers' holders and store each one's balance at block 0. A page's
+/// lookup is retried; the cursor only moves once its balances are stored.
+async fn add_genesis_balances(rpc: &ChainRpc, db: &Db) {
+    while let Some((cursor, holders)) =
+        db::holders_without_genesis_balance(db, 1000).expect("genesis holders")
+    {
+        let mut wait = Duration::from_millis(250);
+        let balances = loop {
+            match balances_at_genesis(rpc, &holders).await {
+                Ok(balances) => break balances,
+                Err(e) if wait > Duration::from_secs(8) => panic!("genesis balances: {e:#}"),
+                Err(_) => tokio::time::sleep(wait).await,
+            }
+            wait *= 2;
+        };
+        let rows: Vec<_> = holders.into_iter().zip(balances).collect();
+        db::save_genesis_balances(db, &rows, cursor).expect("save genesis balances");
     }
 }
 
@@ -261,7 +286,11 @@ fn rows(conn: &Connection, spec: &Spec, cols: &[String]) -> Rows {
 fn compare(baseline: &Connection, fresh: &Connection) -> (Vec<String>, Vec<(String, usize)>) {
     let mut diffs = Vec::new();
     let mut compared = Vec::new();
-    for table in tables(fresh) {
+    let mut all_tables = tables(baseline);
+    all_tables.extend(tables(fresh));
+    all_tables.sort();
+    all_tables.dedup();
+    for table in all_tables {
         if !NOT_INDEXED.contains(&table.as_str()) && !SPECS.iter().any(|s| s.table == table) {
             diffs.push(format!(
                 "{table}: no comparison spec; add it to SPECS or NOT_INDEXED in tests/baseline.rs"
@@ -269,21 +298,33 @@ fn compare(baseline: &Connection, fresh: &Connection) -> (Vec<String>, Vec<(Stri
         }
     }
     for spec in SPECS {
-        let fresh_cols = columns(fresh, spec.table);
-        let base_cols = columns(baseline, spec.table);
-        let cols: Vec<String> = fresh_cols
-            .into_iter()
-            .filter(|c| !spec.skip.contains(&c.as_str()))
-            .collect();
-        if base_cols.is_empty() {
-            diffs.push(format!("{}: table missing from the baseline", spec.table));
-            continue;
+        // Both directions: a column the re-index no longer writes is lost
+        // data, not a column to stop comparing.
+        let compared_cols = |conn| -> Vec<String> {
+            columns(conn, spec.table)
+                .into_iter()
+                .filter(|c| !spec.skip.contains(&c.as_str()))
+                .collect()
+        };
+        let (base_cols, cols) = (compared_cols(baseline), compared_cols(fresh));
+        let mut schema_diffs = Vec::new();
+        for (side, present, other) in [
+            ("baseline", &base_cols, &cols),
+            ("re-index", &cols, &base_cols),
+        ] {
+            if present.is_empty() {
+                schema_diffs.push(format!("{}: table missing from the {side}", spec.table));
+            } else {
+                for col in other.iter().filter(|c| !present.contains(c)) {
+                    schema_diffs.push(format!(
+                        "{}: column {col} missing from the {side}",
+                        spec.table
+                    ));
+                }
+            }
         }
-        if let Some(missing) = cols.iter().find(|c| !base_cols.contains(c)) {
-            diffs.push(format!(
-                "{}: column {missing} missing from the baseline",
-                spec.table
-            ));
+        if !schema_diffs.is_empty() {
+            diffs.extend(schema_diffs);
             continue;
         }
         let (base, new) = (rows(baseline, spec, &cols), rows(fresh, spec, &cols));
@@ -394,6 +435,8 @@ async fn build_baseline() {
         "transfer_events",
         "anchoring_events",
         "token_metadata",
+        "token_balances",
+        "genesis_balances",
     ] {
         let n: i64 = conn
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
