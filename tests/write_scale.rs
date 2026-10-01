@@ -5,7 +5,6 @@ use std::time::Instant;
 
 use nvnmchain_explorer::db::{self, save_block_bundle, save_block_bundles, Db};
 use nvnmchain_explorer::models::{Block, BlockBundle, Transaction};
-use std::sync::{Arc, Mutex};
 
 const BLOCKS: u64 = 2_000;
 const TXS_PER_BLOCK: usize = 5;
@@ -61,8 +60,8 @@ fn bundle(number: u64) -> BlockBundle {
 
 fn fresh() -> (tempfile::TempDir, Db) {
     let dir = tempfile::tempdir().unwrap();
-    let conn = db::init_db(dir.path().join("explorer.db").to_str().unwrap()).unwrap();
-    (dir, Arc::new(Mutex::new(conn)))
+    let db = db::open(dir.path().join("explorer.db").to_str().unwrap()).unwrap();
+    (dir, db)
 }
 
 #[test]
