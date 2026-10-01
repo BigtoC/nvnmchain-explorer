@@ -14,7 +14,9 @@ use crate::models::{
 };
 use crate::summary::ZERO_ADDRESS;
 
-pub type Db = Arc<Mutex<Connection>>;
+/// The explorer's database. Cheap to clone; every clone shares one connection.
+#[derive(Clone)]
+pub struct Db(Arc<Mutex<Connection>>);
 
 /// Decode a `0x`-prefixed hex string into raw bytes for BLOB storage (hashes
 /// and addresses are stored binary — half the TEXT size, and the hash/address
@@ -409,8 +411,13 @@ pub fn page_offset(page: u32, per_page: u32) -> i64 {
     i64::from(page.saturating_sub(1)) * i64::from(per_page)
 }
 
-pub fn lock<'a>(db: &'a Db) -> MutexGuard<'a, Connection> {
-    db.lock().unwrap_or_else(|e| e.into_inner())
+pub fn lock(db: &Db) -> MutexGuard<'_, Connection> {
+    db.0.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Open (creating if needed) the database at `path` and bring its schema up to date.
+pub fn open(path: &str) -> Result<Db> {
+    Ok(Db(Arc::new(Mutex::new(init_db(path)?))))
 }
 
 // ---------------------------------------------------------------------------
