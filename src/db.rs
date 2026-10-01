@@ -126,7 +126,7 @@ fn query_count<P: rusqlite::Params>(conn: &Connection, what: &str, sql: &str, pa
 /// Whether a table holds anything at all, stopping at the first row rather than
 /// counting. The name is interpolated because SQLite cannot bind an identifier;
 /// every caller passes a literal.
-pub fn table_has_rows(conn: &Connection, table: &str) -> bool {
+fn table_has_rows(conn: &Connection, table: &str) -> bool {
     query_count(
         conn,
         "table_has_rows",
@@ -420,11 +420,14 @@ pub fn open(path: &str) -> Result<Db> {
     Ok(Db(Arc::new(Mutex::new(init_db(path)?))))
 }
 
+mod indexer_jobs;
+pub use indexer_jobs::{compute_and_store_stats, repair_derived_tables, save_anchoring_window};
+
 // ---------------------------------------------------------------------------
 // Key/value store (precomputed stats, etc.)
 // ---------------------------------------------------------------------------
 
-pub fn set_kv(conn: &Connection, key: &str, value: &str) -> Result<()> {
+fn set_kv(conn: &Connection, key: &str, value: &str) -> Result<()> {
     exec_cached(
         conn,
         "INSERT INTO kv (key, value, updated_at) VALUES (?1, ?2, ?3)
@@ -1074,7 +1077,7 @@ pub fn search_tokens(db: &Db, q: &str, limit: u32) -> Vec<TokenMetadata> {
 
 /// Insert one anchoring write; `false` when (block_number, log_index) is
 /// already stored.
-pub(crate) fn insert_anchoring(conn: &Connection, event: &AnchoringEvent) -> Result<bool> {
+fn insert_anchoring(conn: &Connection, event: &AnchoringEvent) -> Result<bool> {
     let inserted = exec_cached(
         conn,
         "INSERT OR IGNORE INTO anchoring_events (tx_hash, block_number, log_index, timestamp, event, registry_id, record_id, caller)
