@@ -12,6 +12,10 @@ const NAME_CALL: &str = "0x06fdde03";
 const SYMBOL_CALL: &str = "0x95d89b41";
 const DECIMALS_CALL: &str = "0x313ce567";
 const TOTAL_SUPPLY_CALL: &str = "0x18160ddd";
+const BALANCE_OF_CALL: &str = "0x70a08231";
+const GENESIS: &str = "0x0";
+/// The JSON-RPC error code of a call that ran and reverted.
+const EXECUTION_REVERTED: i64 = 3;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TokenMeta {
@@ -173,6 +177,40 @@ pub async fn fetch_token_metadata(rpc: &ChainRpc, address: &str) -> Result<Token
     })
 }
 
+/// Each holder's balance at block 0, in one request. A token not created yet
+/// reverts, which reads as 0.
+pub async fn balances_at_genesis(
+    rpc: &ChainRpc,
+    holders: &[(String, String)],
+) -> Result<Vec<String>> {
+    if holders.is_empty() {
+        return Ok(Vec::new());
+    }
+    let calls = holders
+        .iter()
+        .map(|(token, holder)| {
+            let data = format!(
+                "{BALANCE_OF_CALL}{:0>64}",
+                holder.trim_start_matches("0x").to_lowercase()
+            );
+            (
+                "eth_call".to_string(),
+                json!([{"to": token, "data": data}, GENESIS]),
+            )
+        })
+        .collect();
+    rpc.batch_call(calls)
+        .await?
+        .into_iter()
+        .map(|r| match r {
+            Ok(v) => Ok(decode_uint256_result(v.as_str().unwrap_or("0x"))),
+            Err(e) if e.code == EXECUTION_REVERTED => Ok("0".into()),
+            Err(e) => Err(e.into()),
+        })
+        .collect::<Result<_>>()
+        .context("reading balances at genesis")
+}
+
 fn infer_currency(symbol: &str) -> String {
     let upper = symbol.to_uppercase();
     if upper.ends_with("USD") || matches!(upper.as_str(), "USDC" | "USDT" | "DAI" | "FRAX") {
@@ -251,12 +289,15 @@ mod tests {
         format!("0x{value:064x}")
     }
 
+    /// What the stub answers with a revert instead of a result.
+    const REVERT: &str = "revert";
+
     /// A node that answers `eth_call` from a selector table, recording what it
     /// was asked and how many HTTP requests carried the questions.
     struct StubNode {
         url: String,
         requests: Arc<AtomicUsize>,
-        asked: Arc<Mutex<Vec<String>>>,
+        asked: Arc<Mutex<Vec<Value>>>,
     }
 
     impl StubNode {
@@ -264,7 +305,8 @@ mod tests {
             self.requests.load(Ordering::SeqCst)
         }
 
-        fn asked(&self) -> Vec<String> {
+        /// Each call's params.
+        fn asked(&self) -> Vec<Value> {
             self.asked.lock().unwrap_or_else(|e| e.into_inner()).clone()
         }
     }
@@ -273,7 +315,7 @@ mod tests {
         use axum::{routing::post, Json, Router};
 
         let requests = Arc::new(AtomicUsize::new(0));
-        let asked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let asked: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let table = Arc::new(answers);
 
         let handler = {
@@ -290,7 +332,7 @@ mod tests {
                     asked
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .push(data.clone());
+                        .push(call.get("params").cloned().unwrap_or(Value::Null));
                     // A view the token does not implement answers empty, which
                     // is what a node returns for a call to a missing selector.
                     let result = table
@@ -298,11 +340,12 @@ mod tests {
                         .find(|(selector, _)| *selector == data)
                         .map(|(_, hex)| hex.clone())
                         .unwrap_or_else(|| "0x".into());
-                    out.push(json!({
-                        "jsonrpc": "2.0",
-                        "id": call.get("id").cloned().unwrap_or(Value::Null),
-                        "result": result,
-                    }));
+                    let id = call.get("id").cloned().unwrap_or(Value::Null);
+                    out.push(if result == REVERT {
+                        json!({"jsonrpc": "2.0", "id": id, "error": {"code": 3, "message": "execution reverted"}})
+                    } else {
+                        json!({"jsonrpc": "2.0", "id": id, "result": result})
+                    });
                 }
                 async move { Json(Value::Array(out)) }
             }
@@ -319,6 +362,36 @@ mod tests {
             requests,
             asked,
         }
+    }
+
+    /// Every holder in one request, at block 0; a holder of a token the chain
+    /// had not created yet, whose balanceOf reverts there, held nothing.
+    #[tokio::test]
+    async fn genesis_balances_are_read_at_block_zero() {
+        let token = "0x20c0000000000000000000000000000000000000";
+        let funded = "0x1111111111111111111111111111111111111111";
+        let unfunded = "0x2222222222222222222222222222222222222222";
+        let later = "0x3333333333333333333333333333333333333333";
+        const FUNDED_BALANCE: &str = concat!(
+            "0x70a08231000000000000000000000000",
+            "1111111111111111111111111111111111111111"
+        );
+        const LATER_BALANCE: &str = concat!(
+            "0x70a08231000000000000000000000000",
+            "3333333333333333333333333333333333333333"
+        );
+        let node = stub_node(vec![
+            (FUNDED_BALANCE, abi_uint(5)),
+            (LATER_BALANCE, REVERT.into()),
+        ])
+        .await;
+        let rpc = ChainRpc::new(&node.url).expect("rpc");
+
+        let holders = [funded, unfunded, later].map(|h| (token.to_string(), h.to_string()));
+        let balances = balances_at_genesis(&rpc, &holders).await.expect("read");
+        assert_eq!(balances, ["5", "0", "0"]);
+        assert_eq!(node.requests(), 1);
+        assert!(node.asked().iter().all(|p| p[1] == GENESIS));
     }
 
     /// The indexer fetches metadata for every token a block introduces, so the

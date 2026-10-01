@@ -732,6 +732,41 @@ async fn a_token_lists_its_holders() {
     );
 }
 
+/// A holder genesis funded spends what no transfer gave it: its balance at
+/// block 0 makes it a holder, once, and again after a rebuild.
+#[test]
+fn a_genesis_balance_counts_once() {
+    let (_dir, db) = temp_db("genesis.db");
+    let token = checksum_address(TOKEN);
+    let sender = checksum_address(SENDER);
+    let held = |db: &Db| {
+        db::get_token_holders(db, &token, 1, 100)
+            .into_iter()
+            .find(|(holder, _)| *holder == sender)
+            .map(|(_, balance)| balance)
+    };
+    db::save_block_bundle(&db, &transfer_bundle()).expect("save");
+    assert_eq!(held(&db), None, "negative until its genesis balance is in");
+
+    let (cursor, holders) = db::holders_without_genesis_balance(&db, 1000)
+        .expect("holders")
+        .expect("new transfers");
+    assert!(holders.contains(&(token.clone(), sender.clone())));
+    let genesis = [((token.clone(), sender.clone()), "100000000".to_string())];
+    db::save_genesis_balances(&db, &genesis, cursor).expect("save");
+    db::save_genesis_balances(&db, &genesis, cursor).expect("save again");
+    assert!(db::holders_without_genesis_balance(&db, 1000)
+        .expect("holders")
+        .is_none());
+
+    // 100 at genesis, less the 30 sent.
+    assert_eq!(held(&db).as_deref(), Some("70000000"));
+    assert_eq!(db::get_token_holder_count(&db, &token), TRANSFER_COUNT + 1);
+    db::rebuild_token_balances(&db.lock().unwrap()).expect("rebuild");
+    assert_eq!(held(&db).as_deref(), Some("70000000"));
+    assert_eq!(db::get_token_holder_count(&db, &token), TRANSFER_COUNT + 1);
+}
+
 /// Addresses are copied all day; every page that shows one must offer it.
 #[tokio::test]
 async fn addresses_are_copyable_and_labelled() {
