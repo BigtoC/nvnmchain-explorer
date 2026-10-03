@@ -30,13 +30,17 @@ database with what `init_db` builds in an empty in-memory database:
 
 - every column's name, declared type, `NOT NULL` and default, and the column
   order;
-- the primary key, `AUTOINCREMENT` and every `UNIQUE` constraint;
+- the primary key, with each key column's direction and collation;
+  `AUTOINCREMENT`; and every `UNIQUE` constraint;
 - every index written as `CREATE INDEX`: its key columns and direction,
   uniqueness, and its SQL (case and whitespace ignored), which alone shows a
   partial predicate or an expression.
 
 A table only in the database is ignored: upstream retires tables with `DROP
 TABLE IF EXISTS`, which has already run.
+
+The collation of a column outside every key is not compared:
+`pragma_table_info` does not report it, and no index carries it.
 
 On any difference the explorer exits before it binds the port. On Fly (one
 machine, replaced in place) and under systemd (`Restart=always`) the explorer
@@ -52,7 +56,7 @@ the database's tables differ from what this build creates, so it was not opened 
 blocks: column finalized: missing
 blocks: index idx_blocks_timestamp: definition differs
   recovery: no watermark exists, and the backfill only walks below MIN(blocks.number): stop the explorer and re-index from an empty database file.
-  recovery for idx_blocks_timestamp: `DROP INDEX idx_blocks_timestamp;` and restart; init_db rebuilds it from the existing rows.
+  recovery for idx_blocks_timestamp: `DROP INDEX "idx_blocks_timestamp";` and restart; init_db rebuilds it from the existing rows.
 ```
 
 Lines labelled `column …` or `table: …` are **table drift**: only re-deriving
@@ -77,11 +81,23 @@ Back up the database file before dropping anything.
 
 ### When `init_db` itself fails
 
-The check runs after `init_db`. If an upstream change adds an index over a
-column an old table lacks, `init_db`'s `CREATE INDEX` fails first, with
-SQLite's own `no such column` error and no recovery hint. The fixture test
-(below) catches that case on the sync PR too, because it opens copies of the
-fixtures the same way.
+The check runs after `init_db`, and an old table can fail `init_db` first:
+an upstream index over a column the table lacks fails its `CREATE INDEX` with
+`no such column`, and a `counters` table without `n` fails `seed_counters`.
+`db::open` then reopens the file read-only and compares the tables both it
+and `init_db` have. When any differ, the error starts with the same lines and
+recoveries as above, under "init_db failed on a database whose tables differ
+from what this build creates", and ends with `init_db`'s own error. Missing
+tables and indexes are left out: `init_db` creates those, and may have stopped
+before it reached them. With no table drift, `init_db`'s error is reported
+unchanged.
+
+This is a diagnosis after the failure, not a check before `init_db`. A check
+first would refuse a database that an in-place fix in `init_db` (a guarded
+`ALTER TABLE … ADD COLUMN`, as upstream has used before) was about to repair,
+and block the deploy that carries it. The fixture test (below) catches these
+cases on the sync PR too, because it opens copies of the fixtures the same
+way.
 
 ## Upstream merges
 
