@@ -10,6 +10,9 @@
 //! unless `PG_TEST_URL` names a server; a run that ignores them all is not a
 //! pass. Each test works in a schema of its own, dropped only when it passes.
 //!
+//! The SQL built at run time is wrapped in `AssertSqlSafe`: it interpolates
+//! only this file's constants and names read from the catalog or a fixture.
+//!
 //! ```text
 //! docker compose up -d --wait
 //! PG_TEST_URL=postgres://explorer:explorer@localhost:5432/explorer \
@@ -22,8 +25,12 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::types::Value as Sql;
 use rusqlite::{Connection, OpenFlags};
-use tokio_postgres::types::{ToSql, Type};
-use tokio_postgres::{Client, NoTls};
+use sqlx::postgres::{PgArguments, PgConnection, Postgres};
+use sqlx::query::Query;
+use sqlx::{
+    AssertSqlSafe, Column as _, Connection as _, Either, Executor as _, Row as _, SqlSafeStr as _,
+    Statement as _, TypeInfo as _,
+};
 
 #[allow(dead_code)]
 mod common;
@@ -76,13 +83,13 @@ const HERE: &str = "(SELECT oid FROM pg_namespace WHERE nspname = current_schema
 
 /// A connection whose `search_path` is a fresh schema of the test's own.
 struct Scratch {
-    client: Client,
+    conn: PgConnection,
     schema: String,
 }
 
-fn pg_error(e: &tokio_postgres::Error) -> String {
-    match e.as_db_error() {
-        Some(db) => format!("{} ({})", db.message(), db.code().code()),
+fn pg_error(e: &sqlx::Error) -> String {
+    match e.as_database_error() {
+        Some(db) => format!("{} ({})", db.message(), db.code().unwrap_or_default()),
         None => e.to_string(),
     }
 }
@@ -95,40 +102,38 @@ async fn scratch(test: &str) -> Scratch {
              `docker compose up -d --wait` (see AGENTS.md)"
         )
     });
-    let (client, connection) = tokio_postgres::connect(&url, NoTls)
+    let mut conn = PgConnection::connect(&url)
         .await
         .unwrap_or_else(|e| panic!("connect to PG_TEST_URL: {}", pg_error(&e)));
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("postgres connection: {}", pg_error(&e));
-        }
-    });
     let schema = format!("t_{test}_{}", std::process::id());
-    client
-        .batch_execute(&format!(
-            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; \
-             SET search_path TO {schema}"
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("set up schema {schema}: {}", pg_error(&e)));
-    Scratch { client, schema }
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; \
+         SET search_path TO {schema}"
+    )))
+    .execute(&mut conn)
+    .await
+    .unwrap_or_else(|e| panic!("set up schema {schema}: {}", pg_error(&e)));
+    Scratch { conn, schema }
 }
 
 impl Scratch {
-    async fn apply_schema(&self) {
-        self.client
-            .batch_execute(SCHEMA)
+    async fn apply_schema(&mut self) {
+        sqlx::raw_sql(SCHEMA)
+            .execute(&mut self.conn)
             .await
             .unwrap_or_else(|e| panic!("apply schema_pg.sql: {}", pg_error(&e)));
     }
 
     /// Drop the schema. Only a passing test calls this, so a failed one
     /// leaves its tables to inspect.
-    async fn finish(self) {
-        self.client
-            .batch_execute(&format!("DROP SCHEMA {} CASCADE", self.schema))
-            .await
-            .unwrap_or_else(|e| panic!("drop schema {}: {}", self.schema, pg_error(&e)));
+    async fn finish(mut self) {
+        sqlx::raw_sql(AssertSqlSafe(format!(
+            "DROP SCHEMA {} CASCADE",
+            self.schema
+        )))
+        .execute(&mut self.conn)
+        .await
+        .unwrap_or_else(|e| panic!("drop schema {}: {}", self.schema, pg_error(&e)));
     }
 }
 
@@ -138,7 +143,7 @@ impl Scratch {
 
 /// Everything the schema holds, one line per column, constraint, relation and
 /// index definition.
-async fn catalog(client: &Client) -> Vec<String> {
+async fn catalog(conn: &mut PgConnection) -> Vec<String> {
     let sql = format!(
         "SELECT 'column ' || table_name || '.' || column_name || ' ' || data_type
                 || ' ' || is_nullable || ' ' || coalesce(column_default, '-')
@@ -154,19 +159,21 @@ async fn catalog(client: &Client) -> Vec<String> {
          SELECT 'index ' || indexdef FROM pg_indexes WHERE schemaname = current_schema()
          ORDER BY 1"
     );
-    let rows = client.query(&sql, &[]).await.unwrap();
-    rows.iter().map(|r| r.get(0)).collect()
+    sqlx::query_scalar(AssertSqlSafe(sql))
+        .fetch_all(conn)
+        .await
+        .unwrap_or_else(|e| panic!("read the catalog: {}", pg_error(&e)))
 }
 
 #[tokio::test]
 #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
 async fn applying_the_schema_twice_changes_nothing() {
-    let pg = scratch("idempotence").await;
+    let mut pg = scratch("idempotence").await;
     pg.apply_schema().await;
-    let once = catalog(&pg.client).await;
+    let once = catalog(&mut pg.conn).await;
     assert!(!once.is_empty(), "schema_pg.sql created nothing");
     pg.apply_schema().await;
-    assert_eq!(catalog(&pg.client).await, once);
+    assert_eq!(catalog(&mut pg.conn).await, once);
     pg.finish().await;
 }
 
@@ -389,20 +396,19 @@ fn sqlite_shape(conn: &Connection) -> Shape {
     shape
 }
 
-async fn pg_shape(client: &Client) -> Shape {
+async fn pg_shape(conn: &mut PgConnection) -> Shape {
     let mut shape = Shape::default();
-    let cols = client
-        .query(
-            "SELECT table_name::text, column_name::text, data_type::text,
-                    is_nullable = 'NO', column_default::text, is_identity = 'YES'
-             FROM information_schema.columns WHERE table_schema = current_schema()
-             ORDER BY table_name, ordinal_position",
-            &[],
-        )
-        .await
-        .unwrap();
+    let cols = sqlx::query(
+        "SELECT table_name::text, column_name::text, data_type::text,
+                is_nullable = 'NO', column_default::text, is_identity = 'YES'
+         FROM information_schema.columns WHERE table_schema = current_schema()
+         ORDER BY table_name, ordinal_position",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap_or_else(|e| panic!("read columns: {}", pg_error(&e)));
     for row in cols {
-        let class = match row.get::<_, String>(2).as_str() {
+        let class = match row.get::<String, _>(2).as_str() {
             "bigint" => "int".to_string(),
             "text" => "text".to_string(),
             "bytea" => "bytes".to_string(),
@@ -413,28 +419,25 @@ async fn pg_shape(client: &Client) -> Shape {
             Col {
                 class,
                 not_null: row.get(3),
-                default: row.get::<_, Option<String>>(4).as_deref().map(pg_lit),
+                default: row.get::<Option<String>, _>(4).as_deref().map(pg_lit),
                 auto: row.get(5),
             },
         );
     }
 
-    let constraints = client
-        .query(
-            &format!(
-                "SELECT t.relname::text, c.contype = 'p',
-                        ARRAY(SELECT a.attname::text
-                              FROM unnest(c.conkey) WITH ORDINALITY k(attnum, ord)
-                              JOIN pg_attribute a
-                                ON a.attrelid = c.conrelid AND a.attnum = k.attnum
-                              ORDER BY k.ord)
-                 FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
-                 WHERE t.relnamespace = {HERE} AND c.contype IN ('p', 'u')"
-            ),
-            &[],
-        )
-        .await
-        .unwrap();
+    let constraints = sqlx::query(AssertSqlSafe(format!(
+        "SELECT t.relname::text, c.contype = 'p',
+                ARRAY(SELECT a.attname::text
+                      FROM unnest(c.conkey) WITH ORDINALITY k(attnum, ord)
+                      JOIN pg_attribute a
+                        ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+                      ORDER BY k.ord)
+         FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+         WHERE t.relnamespace = {HERE} AND c.contype IN ('p', 'u')"
+    )))
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap_or_else(|e| panic!("read constraints: {}", pg_error(&e)));
     for row in constraints {
         let kind = if row.get(1) { "primary key" } else { "unique" };
         let cols: Vec<String> = row.get(2);
@@ -445,29 +448,26 @@ async fn pg_shape(client: &Client) -> Shape {
             .insert(key(kind, &cols));
     }
 
-    let indexes = client
-        .query(
-            &format!(
-                "SELECT ic.relname::text, tc.relname::text, i.indisunique,
-                        i.indpred IS NOT NULL, i.indexprs IS NOT NULL,
-                        ARRAY(SELECT coalesce(a.attname::text, '<expr>')
-                                     || CASE WHEN i.indoption[k] & 1 = 1
-                                             THEN ' DESC' ELSE '' END
-                              FROM generate_series(0, i.indnkeyatts - 1) k
-                              LEFT JOIN pg_attribute a
-                                ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
-                              ORDER BY k)
-                 FROM pg_index i
-                 JOIN pg_class ic ON ic.oid = i.indexrelid
-                 JOIN pg_class tc ON tc.oid = i.indrelid
-                 WHERE tc.relnamespace = {HERE}
-                   AND NOT EXISTS (SELECT 1 FROM pg_constraint c
-                                   WHERE c.conindid = i.indexrelid)"
-            ),
-            &[],
-        )
-        .await
-        .unwrap();
+    let indexes = sqlx::query(AssertSqlSafe(format!(
+        "SELECT ic.relname::text, tc.relname::text, i.indisunique,
+                i.indpred IS NOT NULL, i.indexprs IS NOT NULL,
+                ARRAY(SELECT coalesce(a.attname::text, '<expr>')
+                             || CASE WHEN i.indoption[k] & 1 = 1
+                                     THEN ' DESC' ELSE '' END
+                      FROM generate_series(0, i.indnkeyatts - 1) k
+                      LEFT JOIN pg_attribute a
+                        ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
+                      ORDER BY k)
+         FROM pg_index i
+         JOIN pg_class ic ON ic.oid = i.indexrelid
+         JOIN pg_class tc ON tc.oid = i.indrelid
+         WHERE tc.relnamespace = {HERE}
+           AND NOT EXISTS (SELECT 1 FROM pg_constraint c
+                           WHERE c.conindid = i.indexrelid)"
+    )))
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap_or_else(|e| panic!("read indexes: {}", pg_error(&e)));
     for row in indexes {
         let (partial, expression): (bool, bool) = (row.get(3), row.get(4));
         shape.indexes.insert(
@@ -485,20 +485,18 @@ async fn pg_shape(client: &Client) -> Shape {
 
 /// The `text` columns of the schema not collated `"C"`, which SQLite's
 /// `BINARY` comparison matches whatever the server's locale.
-async fn uncollated(client: &Client) -> Vec<String> {
-    let rows = client
-        .query(
-            "SELECT table_name::text || '.' || column_name::text || ': collation '
-                    || coalesce(collation_name::text, 'default') || ', must be \"C\"'
-             FROM information_schema.columns
-             WHERE table_schema = current_schema() AND data_type = 'text'
-               AND coalesce(collation_name::text, '') <> 'C'
-             ORDER BY 1",
-            &[],
-        )
-        .await
-        .unwrap();
-    rows.iter().map(|r| r.get(0)).collect()
+async fn uncollated(conn: &mut PgConnection) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT table_name::text || '.' || column_name::text || ': collation '
+                || coalesce(collation_name::text, 'default') || ', must be \"C\"'
+         FROM information_schema.columns
+         WHERE table_schema = current_schema() AND data_type = 'text'
+           AND coalesce(collation_name::text, '') <> 'C'
+         ORDER BY 1",
+    )
+    .fetch_all(conn)
+    .await
+    .unwrap_or_else(|e| panic!("read collations: {}", pg_error(&e)))
 }
 
 /// One difference between the two schemas.
@@ -646,9 +644,9 @@ async fn schema_pg_matches_init_db() {
     let path = dir.path().join("parity.db");
     let sqlite = sqlite_shape(&nvnmchain_explorer::db::init_db(path.to_str().unwrap()).unwrap());
 
-    let pg = scratch("parity").await;
+    let mut pg = scratch("parity").await;
     pg.apply_schema().await;
-    let diffs = compare(&sqlite, &pg_shape(&pg.client).await);
+    let diffs = compare(&sqlite, &pg_shape(&mut pg.conn).await);
 
     let mut problems: Vec<String> = diffs
         .iter()
@@ -667,7 +665,7 @@ async fn schema_pg_matches_init_db() {
             ));
         }
     }
-    problems.extend(uncollated(&pg.client).await);
+    problems.extend(uncollated(&mut pg.conn).await);
     assert!(
         problems.is_empty(),
         "schema_pg.sql and init_db differ; port the change using the type rules in \
@@ -718,24 +716,27 @@ fn quoted(cols: &[String]) -> String {
         .join(", ")
 }
 
-/// A SQLite value as a parameter of Postgres type `ty`, typed by the column
-/// even when it is `NULL`; `None` if the stored value does not fit.
-fn bind(ty: &Type, value: &Sql) -> Option<Box<dyn ToSql + Sync + Send>> {
-    let bound: Box<dyn ToSql + Sync + Send> = match value {
-        Sql::Integer(i) if *ty == Type::INT8 => Box::new(Some(*i)),
-        Sql::Null if *ty == Type::INT8 => Box::new(None::<i64>),
-        Sql::Text(s) if *ty == Type::TEXT => Box::new(Some(s.clone())),
-        Sql::Null if *ty == Type::TEXT => Box::new(None::<String>),
-        Sql::Blob(b) if *ty == Type::BYTEA => Box::new(Some(b.clone())),
-        Sql::Null if *ty == Type::BYTEA => Box::new(None::<Vec<u8>>),
+type PgQuery<'q> = Query<'q, Postgres, PgArguments>;
+
+/// `query` with a SQLite value bound as a parameter of Postgres type `ty`
+/// (`INT8`, `TEXT` or `BYTEA`), typed by the column even when it is `NULL`;
+/// `None` if the stored value does not fit. sqlx does not check a bound value
+/// against the statement's parameter types, so this match is the only check.
+fn bind<'q>(query: PgQuery<'q>, ty: &str, value: &Sql) -> Option<PgQuery<'q>> {
+    Some(match (ty, value) {
+        ("INT8", Sql::Integer(i)) => query.bind(*i),
+        ("INT8", Sql::Null) => query.bind(None::<i64>),
+        ("TEXT", Sql::Text(s)) => query.bind(s.clone()),
+        ("TEXT", Sql::Null) => query.bind(None::<String>),
+        ("BYTEA", Sql::Blob(b)) => query.bind(b.clone()),
+        ("BYTEA", Sql::Null) => query.bind(None::<Vec<u8>>),
         _ => return None,
-    };
-    Some(bound)
+    })
 }
 
 /// Copy every row of `table` in one transaction; returns how many.
 async fn copy_table(
-    client: &mut Client,
+    conn: &mut PgConnection,
     sqlite: &Connection,
     table: &str,
     cols: &[String],
@@ -755,13 +756,18 @@ async fn copy_table(
         .map(|i| format!("${i}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let tx = client.transaction().await.unwrap();
-    let insert = tx
-        .prepare(&format!(
-            "INSERT INTO {table} ({list}) VALUES ({placeholders})"
-        ))
+    let mut tx = conn
+        .begin()
+        .await
+        .unwrap_or_else(|e| panic!("{table}: begin: {}", pg_error(&e)));
+    let sql = format!("INSERT INTO {table} ({list}) VALUES ({placeholders})");
+    let insert = (&mut *tx)
+        .prepare(AssertSqlSafe(sql).into_sql_str())
         .await
         .unwrap_or_else(|e| panic!("{table}: prepare insert: {}", pg_error(&e)));
+    let Some(Either::Left(types)) = insert.parameters() else {
+        panic!("{table}: Postgres gave no parameter types for the insert")
+    };
     for row in &source {
         let row_id = || {
             let fields = cols
@@ -771,51 +777,48 @@ async fn copy_table(
                 .collect();
             row_key(spec, &fields)
         };
-        let params: Vec<Box<dyn ToSql + Sync + Send>> = cols
-            .iter()
-            .zip(insert.params())
-            .zip(row)
-            .map(|((col, ty), value)| {
-                bind(ty, value).unwrap_or_else(|| {
-                    panic!(
-                        "{table} {}: {col} holds {value:?}, which a {ty} column cannot",
-                        row_id()
-                    )
-                })
-            })
-            .collect();
-        let refs: Vec<&(dyn ToSql + Sync)> = params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn ToSql + Sync))
-            .collect();
-        tx.execute(&insert, &refs)
+        let mut query = insert.query();
+        for ((col, ty), value) in cols.iter().zip(types).zip(row) {
+            let ty = ty.name();
+            query = bind(query, ty, value).unwrap_or_else(|| {
+                panic!(
+                    "{table} {}: {col} holds {value:?}, which a {ty} column cannot",
+                    row_id()
+                )
+            });
+        }
+        query
+            .execute(&mut *tx)
             .await
             .unwrap_or_else(|e| panic!("{table} {}: insert: {}", row_id(), pg_error(&e)));
     }
-    tx.commit().await.unwrap();
+    tx.commit()
+        .await
+        .unwrap_or_else(|e| panic!("{table}: commit: {}", pg_error(&e)));
     source.len()
 }
 
 /// A table's rows read back, converted with the same rules as the fixture's.
-async fn pg_rows(client: &Client, spec: &Spec, cols: &[String]) -> Rows {
-    let found = client
-        .query(&format!("SELECT {} FROM {}", quoted(cols), spec.table), &[])
-        .await
-        .unwrap();
+async fn pg_rows(conn: &mut PgConnection, spec: &Spec, cols: &[String]) -> Rows {
+    let found = sqlx::query(AssertSqlSafe(format!(
+        "SELECT {} FROM {}",
+        quoted(cols),
+        spec.table
+    )))
+    .fetch_all(conn)
+    .await
+    .unwrap_or_else(|e| panic!("{}: read back: {}", spec.table, pg_error(&e)));
     let mut out = Rows::new();
     for row in &found {
         let mut fields = BTreeMap::new();
         for (i, col) in cols.iter().enumerate() {
-            let ty = row.columns()[i].type_();
-            let value = if *ty == Type::INT8 {
-                row.get::<_, Option<i64>>(i).map_or(Sql::Null, Sql::Integer)
-            } else if *ty == Type::TEXT {
-                row.get::<_, Option<String>>(i).map_or(Sql::Null, Sql::Text)
-            } else if *ty == Type::BYTEA {
-                row.get::<_, Option<Vec<u8>>>(i)
-                    .map_or(Sql::Null, Sql::Blob)
-            } else {
-                panic!("{}.{col}: unexpected type {ty}", spec.table)
+            let value = match row.columns()[i].type_info().name() {
+                "INT8" => row.get::<Option<i64>, _>(i).map_or(Sql::Null, Sql::Integer),
+                "TEXT" => row.get::<Option<String>, _>(i).map_or(Sql::Null, Sql::Text),
+                "BYTEA" => row
+                    .get::<Option<Vec<u8>>, _>(i)
+                    .map_or(Sql::Null, Sql::Blob),
+                ty => panic!("{}.{col}: unexpected type {ty}", spec.table),
             };
             fields.insert(col.clone(), to_json(col, value));
         }
@@ -846,12 +849,12 @@ async fn every_baseline_round_trips_through_postgres() {
             .filter(|t| t != "sqlite_sequence")
         {
             let cols = columns(&sqlite, &table);
-            let n = copy_table(&mut pg.client, &sqlite, &table, &cols).await;
+            let n = copy_table(&mut pg.conn, &sqlite, &table, &cols).await;
             copied += n;
             let spec = spec(&table);
             let (base, back) = (
                 rows(&sqlite, spec, &cols),
-                pg_rows(&pg.client, spec, &cols).await,
+                pg_rows(&mut pg.conn, spec, &cols).await,
             );
             assert_eq!(base.len(), n, "{table}: duplicate row keys in the fixture");
             diffs.extend(diff_rows(
