@@ -288,7 +288,12 @@ variable when it is unset. A job that runs the tests without the variable
 therefore fails, and cannot pass by skipping. A run that reports
 `0 passed; N ignored` is not a pass.
 
-**Client.** `tokio-postgres` with `NoTls`, as a dev-dependency only.
+**Client.** `sqlx` 0.9 with only its `postgres` and `runtime-tokio` features
+(no TLS, no macros), as a dev-dependency only. Each test holds one
+`PgConnection`, not a pool, because `SET search_path` belongs to the session.
+Multi-statement SQL (the schema file, the scratch setup) goes through
+`sqlx::raw_sql`; SQL built at run time is wrapped in `AssertSqlSafe`, since
+it interpolates only the test's own constants and catalog or fixture names.
 
 **Isolation.**
 
@@ -354,10 +359,11 @@ The tests:
    - Copy every row of every table except `sqlite_sequence`, one transaction
      per table, with a generic `INSERT`.
      - Each parameter's Rust type comes from the prepared statement's
-       `Statement::params()`: `Option<i64>` for `INT8`, `Option<String>` for
-       `TEXT` and `Option<Vec<u8>>` for `BYTEA`.
+       parameter types (`Statement::parameters()`): `Option<i64>` for
+       `INT8`, `Option<String>` for `TEXT` and `Option<Vec<u8>>` for `BYTEA`.
      - A SQLite `NULL` is bound as `None` of that column's own type, because
-       tokio-postgres type-checks `Option<T>` even when it is `None`.
+       a bound `Option<T>` carries `T`'s Postgres type even when it is
+       `None`.
      - A SQLite value whose storage class does not fit the column fails the
        test, naming the table, column and row key. This is the
        dynamic-typing trap the test exists to catch.
@@ -476,9 +482,11 @@ through `clippy --all-targets`.
   `POSTGRES_INITDB_ARGS` as `-c max_connections=…` (initdb `--set`, available
   since Postgres 16).
 
-**Dependency.** `[dev-dependencies] tokio-postgres = "0.7"`, with no TLS
-feature. Phase 3 promotes it to a normal dependency, with
-`tokio-postgres-rustls`.
+**Dependency.** `[dev-dependencies] sqlx = { version = "0.9",
+default-features = false, features = ["runtime-tokio", "postgres"] }`.
+Phase 3 promotes it to a normal dependency and adds a rustls TLS feature.
+The `sqlite` feature stays off, because the SQLite backend stays on
+`rusqlite`.
 
 ### 5. Docs
 
@@ -552,8 +560,8 @@ rebuild and the anchoring read-back, which are still true.
 **Keep the public `db::*` API synchronous**, and write the Postgres backend as
 async code:
 
-- `tokio-postgres` 0.7 plus `deadpool-postgres` 0.14;
-- rustls through `tokio-postgres-rustls`, with the `ring` provider;
+- `sqlx` 0.9 (`postgres`, `runtime-tokio`), with its own `PgPool`;
+- rustls through sqlx's `tls-rustls-ring-webpki` feature;
 - a private multi-thread runtime.
 
 The two meet in one bridge, `run(fut)`, which checks `Handle::try_current()`:
@@ -594,8 +602,7 @@ Why:
 - Every tokio resource is created inside the database future.
 - A thread-local guard panics on a re-entrant `db::*` call.
 - No `LocalSet`.
-- The seal test's forbidden names gain `tokio_postgres`, `deadpool` and
-  `block_in_place`.
+- The seal test's forbidden names gain `sqlx` and `block_in_place`.
 
 ### Also decided for phase 3
 
