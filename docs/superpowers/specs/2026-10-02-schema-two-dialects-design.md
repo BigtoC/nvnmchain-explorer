@@ -1,6 +1,6 @@
 # Phase 2: one schema, two dialects
 
-Status: draft, awaiting review
+Status: approved 2026-10-02; implemented
 Date: 2026-10-02
 Follows: `2026-10-01-db-boundary-design.md` (phase 1, merged as bb83764)
 
@@ -180,8 +180,12 @@ skip the check, as they do today.
      whether it is partial, and its key columns (a name or an expression, with
      direction).
      - A **created** index is also compared by its `sqlite_master.sql` text
-       after collapsing whitespace, because the pragmas do not show a partial
-       predicate or an expression.
+       with case and whitespace dropped outside string literals, because the
+       pragmas do not show a partial predicate or an expression. Dropping
+       case and all whitespace, not just collapsing it, keeps a reformatted
+       `init_db` statement from refusing every deployed database.
+     - The table's `sqlite_master.sql` is checked for `AUTOINCREMENT`, which
+       `pragma_table_info` does not show.
      - An **automatic** index (`sqlite_autoindex_*`, which backs a `UNIQUE` or
        a non-integer primary key) is compared by origin and columns, not by
        name.
