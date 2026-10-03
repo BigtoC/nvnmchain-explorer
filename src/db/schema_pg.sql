@@ -134,8 +134,9 @@ CREATE TABLE IF NOT EXISTS token_balances (
     PRIMARY KEY (token_addr, holder_addr)
 );
 CREATE INDEX IF NOT EXISTS idx_tb_holder ON token_balances (holder_addr);
--- The predicate is `HOLDING` in src/db.rs, word for word: a partial index only
--- serves queries whose filter it provably implies.
+-- The predicate is `HOLDING` in src/db.rs: a partial index only serves queries
+-- whose filter it provably implies. `TRANSLATED` in tests/postgres.rs pins this
+-- definition and `init_db`'s, so a change to either fails until ported.
 CREATE INDEX IF NOT EXISTS idx_tb_holding
     ON token_balances (token_addr, LENGTH(balance) DESC, balance DESC)
     WHERE balance NOT LIKE '-%';
