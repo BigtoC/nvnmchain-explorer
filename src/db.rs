@@ -417,7 +417,7 @@ pub fn lock(db: &Db) -> MutexGuard<'_, Connection> {
 
 /// Open (creating if needed) the database at `path` and bring its schema up to date.
 pub fn open(path: &str) -> Result<Db> {
-    let conn = init_db(path)?;
+    let conn = init_db(path).map_err(|e| schema_check::explain(path, e))?;
     schema_check::verify(&conn).with_context(|| format!("schema of {path}"))?;
     Ok(Db(Arc::new(Mutex::new(conn))))
 }
