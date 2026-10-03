@@ -32,8 +32,12 @@ jobs:
         with:
           submodules: true
 
+      # Pinned to a commit, since a branch can move under us; this is the head
+      # of the action's `stable` branch on 2026-10-01.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
 
       - uses: Swatinem/rust-cache@v2
 
