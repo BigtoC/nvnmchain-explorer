@@ -157,7 +157,7 @@ New file. `open` becomes:
 ```rust
 /// Open (creating if needed) the database at `path` and bring its schema up to date.
 pub fn open(path: &str) -> Result<Db> {
-    let conn = init_db(path)?;
+    let conn = init_db(path).map_err(|e| schema_check::explain(path, e))?;
     schema_check::verify(&conn).with_context(|| format!("schema of {path}"))?;
     Ok(Db(Arc::new(Mutex::new(conn))))
 }
@@ -165,6 +165,20 @@ pub fn open(path: &str) -> Result<Db> {
 
 `init_db` itself does not change. Callers that use `init_db` directly (tests)
 skip the check, as they do today.
+
+**`pub(super) fn explain(path: &str, err: anyhow::Error) -> anyhow::Error`**
+(added after review of PR #4). An old table can fail `init_db` before
+`verify` runs: an index over a column it lacks fails `CREATE INDEX`, and a
+`counters` table without `n` fails `seed_counters`. `explain` reopens the
+file read-only, compares only the tables both it and the expected shape have,
+and leaves indexes out, since `init_db` may have stopped before creating or
+dropping them. With drift, it puts the same report and recoveries as `verify`
+in front of `init_db`'s error; without, the error is unchanged; if the file
+cannot be read, it logs a warning and returns the error unchanged.
+
+It is a diagnosis after the failure, not a check before `init_db`: a check
+first would refuse a database that an in-place fix in `init_db` (a guarded
+`ALTER TABLE … ADD COLUMN`, as upstream has used before) was about to repair.
 
 **`pub(super) fn verify(conn: &Connection) -> Result<()>`**
 
@@ -188,7 +202,12 @@ skip the check, as they do today.
        `pragma_table_info` does not show.
      - An **automatic** index (`sqlite_autoindex_*`, which backs a `UNIQUE` or
        a non-integer primary key) is compared by origin and columns, not by
-       name.
+       name. Its key columns carry direction and collation (collation names
+       upper-cased), so a primary key's index stands in for
+       `pragma_table_info`'s key list, which shows neither; a rowid-alias
+       `INTEGER PRIMARY KEY` has no such index and keeps that list.
+     - The collation of a column outside every key is not compared:
+       `pragma_table_info` does not report it, and no index carries it.
 3. **Compare** the two shapes:
    - **A table that is only in the file:** ignored. Upstream retires tables
      with `DROP TABLE IF EXISTS`, which `init_db` has already run.
@@ -222,7 +241,8 @@ skip the check, as they do today.
    An **index drift** gets its own remedy, because it never needs data
    re-derived: `DROP INDEX <name>` and restart, and `init_db` rebuilds the
    index from the existing rows. The error may print that `DROP INDEX`
-   statement, because it is safe. It never prints a `DROP TABLE` statement.
+   statement, because it is safe, with the name double-quoted and any `"` in
+   it doubled. It never prints a `DROP TABLE` statement.
 
 **At deploy time.** The process exits with this error before it binds the
 port, and nothing stays on the old release:
@@ -335,8 +355,13 @@ The tests:
      origin `c`; on Postgres it is an index in the test schema that no
      `pg_constraint.conindid` points at. Each is compared by name, table,
      whether it is unique, and its key columns with direction.
-     - Expression and partial indexes are compared by name and table only,
-       because their text differs between engines by design.
+     - Expression and partial indexes are spelled differently by each engine,
+       so each is pinned in `TRANSLATED` (added after review of PR #4): its
+       `sqlite_master.sql` from `init_db` and its `pg_get_indexdef` from
+       `schema_pg.sql`, without the scratch schema's prefix. Compared
+       ignoring case and whitespace outside quotes, each side must equal its
+       pin, so a change to either fails until it is ported and the entry
+       updated. A missing or stale entry fails too.
      - Indexes that back a key (`sqlite_autoindex_*`, `*_pkey`, `*_key`) are
        compared only as keys.
    - **Postgres catalog sources:** `information_schema.columns`,
@@ -619,7 +644,7 @@ Why:
   - **3b.** The Postgres backend, plus CI.
   - **3c.** Performance.
 
-**One writer per database.** A writer pool of size 1, plus
+**One writer per database.** A writer pool of size 1, plus session level
 `pg_try_advisory_lock` keyed by database and schema. Readers get a read-only
 pool, about 8 connections, with `statement_timeout`.
 
