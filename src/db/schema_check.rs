@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use anyhow::{bail, Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 /// Compare `conn` with a fresh `init_db`, and fail naming every difference.
 ///
@@ -17,12 +17,63 @@ use rusqlite::Connection;
 /// IF EXISTS`, which `init_db` has already run. Retired indexes are gone for the
 /// same reason, so a created index `conn` has and `init_db` does not is drift.
 pub(super) fn verify(conn: &Connection) -> Result<()> {
-    let expected = shape(&super::init_db(":memory:").context("build the expected schema")?)
-        .context("read the expected schema")?;
     let actual = shape(conn).context("read the database's schema")?;
+    let report = report(&expected()?, &actual)?;
+    if !report.is_empty() {
+        bail!(
+            "the database's tables differ from what this build creates, so it was not opened \
+             (see docs/database.md):\n{report}"
+        );
+    }
+    Ok(())
+}
 
+/// Put table drift in front of `init_db`'s own error when the database at
+/// `path` has any, since an old table can fail `init_db` before `verify` runs.
+///
+/// Diagnosed after the failure rather than checked before `init_db`: an
+/// in-place fix `init_db` may one day carry (a guarded `ALTER TABLE … ADD
+/// COLUMN`) would otherwise be refused before it ran. Only tables both sides
+/// have count: `init_db` creates missing ones, and may have stopped before
+/// creating or dropping an index.
+pub(super) fn explain(path: &str, err: anyhow::Error) -> anyhow::Error {
+    match table_drift_at(path) {
+        Ok(report) if report.is_empty() => err,
+        Ok(report) => err.context(format!(
+            "init_db failed on a database whose tables differ from what this build creates \
+             (see docs/database.md):\n{report}"
+        )),
+        Err(e) => {
+            tracing::warn!("{path}: could not look for table drift behind init_db's error: {e:#}");
+            err
+        }
+    }
+}
+
+/// The report for the tables both the database at `path` and `init_db` have,
+/// with indexes left out.
+fn table_drift_at(path: &str) -> Result<String> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .context("open it read-only")?;
+    let mut actual = shape(&conn).context("read the database's schema")?;
+    let mut expected = expected()?;
+    expected.retain(|name, _| actual.contains_key(name));
+    for table in expected.values_mut().chain(actual.values_mut()) {
+        table.created.clear();
+    }
+    report(&expected, &actual)
+}
+
+/// What `init_db` builds from nothing.
+fn expected() -> Result<BTreeMap<String, Table>> {
+    shape(&super::init_db(":memory:").context("build the expected schema")?)
+        .context("read the expected schema")
+}
+
+/// Every difference, each table's followed by its recovery; empty when none.
+fn report(expected: &BTreeMap<String, Table>, actual: &BTreeMap<String, Table>) -> Result<String> {
     let mut report = String::new();
-    for (name, want) in &expected {
+    for (name, want) in expected {
         let (table, index) = match actual.get(name) {
             None => (vec!["missing".to_string()], Vec::new()),
             Some(have) => (table_drift(have, want), index_drift(have, want)),
@@ -42,19 +93,13 @@ pub(super) fn verify(conn: &Connection) -> Result<()> {
         for index in index.iter().filter_map(|(drop, _)| drop.as_ref()) {
             writeln!(
                 report,
-                "  recovery for {index}: `DROP INDEX {index};` and restart; \
-                 init_db rebuilds it from the existing rows."
+                "  recovery for {index}: `DROP INDEX \"{}\";` and restart; \
+                 init_db rebuilds it from the existing rows.",
+                index.replace('"', "\"\"")
             )?;
         }
     }
-    if !report.is_empty() {
-        bail!(
-            "the database's tables differ from what this build creates, so it was not opened \
-             (see docs/database.md):\n{}",
-            report.trim_end()
-        );
-    }
-    Ok(())
+    Ok(report.trim_end().to_string())
 }
 
 /// What to do about a table whose columns or keys drifted. None of these is a
@@ -172,9 +217,11 @@ fn read_table(conn: &Connection, name: &str, sql: &str) -> Result<Table> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut uniques = Vec::new();
     let mut created = BTreeMap::new();
+    let mut pk_index = None;
     for (index, unique, origin, partial) in listed {
         let keys = index_keys(conn, &index)?;
         match origin.as_str() {
+            "pk" => pk_index = Some(keys),
             "u" => uniques.push(keys),
             "c" => {
                 let sql: String = conn.query_row(
@@ -193,7 +240,6 @@ fn read_table(conn: &Connection, name: &str, sql: &str) -> Result<Table> {
                     },
                 );
             }
-            // A non-integer primary key's index: `primary_key` already says it.
             _ => {}
         }
     }
@@ -201,7 +247,10 @@ fn read_table(conn: &Connection, name: &str, sql: &str) -> Result<Table> {
 
     Ok(Table {
         columns,
-        primary_key: keyed.into_iter().map(|(_, column)| column).collect(),
+        // Any key but a rowid alias (`INTEGER PRIMARY KEY`) has an index, and
+        // only it shows the direction and collation.
+        primary_key: pk_index
+            .unwrap_or_else(|| keyed.into_iter().map(|(_, column)| column).collect()),
         autoincrement: normalize(sql).contains("autoincrement"),
         uniques,
         created,
@@ -223,8 +272,9 @@ fn index_keys(conn: &Connection, index: &str) -> Result<Vec<String>> {
                 key.push_str(" DESC");
             }
             let coll: String = r.get(3)?;
+            // In one case: SQLite matches collation names case-insensitively.
             if !coll.eq_ignore_ascii_case("BINARY") {
-                write!(key, " COLLATE {coll}").expect("write to a String");
+                write!(key, " COLLATE {}", coll.to_uppercase()).expect("write to a String");
             }
             Ok(key)
         })?
@@ -485,6 +535,139 @@ mod tests {
         assert_has(&refusal(&path), &["transfer_events: table: autoincrement"]);
     }
 
+    /// The column metadata and key list match; only the key's index shows it.
+    /// The collation is reported in one case, however the table spelled it.
+    #[test]
+    fn a_collated_primary_key_is_table_drift() {
+        let (_dir, path) = prepared(
+            "CREATE TABLE kv (
+                key TEXT collate nocase PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL DEFAULT 0
+            )",
+        );
+        assert_has(
+            &refusal(&path),
+            &[
+                "kv: table: primary key (key COLLATE NOCASE), expected (key)",
+                "re-index from an empty database file",
+            ],
+        );
+    }
+
+    /// `DESC` makes an `INTEGER PRIMARY KEY` an ordinary key, not the rowid.
+    #[test]
+    fn a_descending_integer_primary_key_is_table_drift() {
+        let (_dir, path) = prepared(
+            "CREATE TABLE blocks (
+                number INTEGER PRIMARY KEY DESC,
+                hash BLOB NOT NULL UNIQUE,
+                parent_hash BLOB NOT NULL,
+                timestamp INTEGER NOT NULL,
+                timestamp_ms INTEGER NOT NULL DEFAULT 0,
+                gas_used INTEGER NOT NULL DEFAULT 0,
+                gas_limit INTEGER NOT NULL DEFAULT 0,
+                miner BLOB NOT NULL DEFAULT X'',
+                tx_count INTEGER NOT NULL DEFAULT 0,
+                base_fee TEXT NOT NULL DEFAULT '0',
+                size INTEGER NOT NULL DEFAULT 0,
+                extra_data TEXT NOT NULL DEFAULT '',
+                epoch INTEGER NOT NULL DEFAULT 0,
+                view INTEGER NOT NULL DEFAULT 0,
+                proposer BLOB NOT NULL DEFAULT X'',
+                created_at INTEGER NOT NULL DEFAULT 0
+            )",
+        );
+        assert_has(
+            &refusal(&path),
+            &[
+                "blocks: table: primary key (number DESC), expected (number)",
+                "re-index from an empty database file",
+            ],
+        );
+    }
+
+    /// Copilot's case: `seed_counters` fails on the old table before the
+    /// check runs, and the report still names the drift and its recovery.
+    #[test]
+    fn drift_that_fails_init_db_is_reported_with_its_error() {
+        let (_dir, path) = prepared("CREATE TABLE counters (name TEXT PRIMARY KEY)");
+        assert_has(
+            &refusal(&path),
+            &[
+                "init_db failed on a database whose tables differ",
+                "counters: column n: missing",
+                "seed_counters recounts it",
+                "no column named n",
+            ],
+        );
+    }
+
+    /// `init_db`'s `CREATE INDEX` over the missing column fails first.
+    #[test]
+    fn an_index_over_a_missing_column_is_reported_as_table_drift() {
+        let (_dir, path) = prepared(
+            "CREATE TABLE transactions (
+                hash BLOB PRIMARY KEY,
+                block_number INTEGER NOT NULL,
+                from_addr BLOB NOT NULL,
+                to_addr BLOB,
+                status INTEGER NOT NULL DEFAULT 1,
+                gas_used INTEGER NOT NULL DEFAULT 0,
+                base_fee TEXT NOT NULL DEFAULT '0',
+                contract_address BLOB,
+                fee_token BLOB,
+                fee_amount TEXT NOT NULL DEFAULT '0',
+                input TEXT NOT NULL DEFAULT '0x',
+                raw BLOB,
+                trace_data TEXT,
+                receipt_data TEXT,
+                timestamp INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT 0
+            )",
+        );
+        // SQLite's error quotes the whole batch, `DROP TABLE IF EXISTS` included.
+        let msg = refusal(&path);
+        let (report, _) = msg
+            .split_once("no such column: position")
+            .unwrap_or_else(|| panic!("init_db's own error is gone:\n{msg}"));
+        assert_has(
+            report,
+            &[
+                "transactions: column position: missing",
+                "re-index from an empty database file",
+            ],
+        );
+    }
+
+    #[test]
+    fn an_init_db_failure_without_drift_keeps_its_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let own = format!("{:#}", db::init_db(path).unwrap_err());
+        let msg = refusal(path);
+        assert_eq!(msg, own);
+        assert!(!msg.contains("differ"), "claims drift:\n{msg}");
+    }
+
+    /// The SQL quotes the name; the labels keep it as written.
+    #[test]
+    fn an_extra_index_with_an_awkward_name_gets_quoted_sql() {
+        let (_dir, path) = edited(
+            "CREATE INDEX \"my index\" ON kv(value);
+             CREATE INDEX \"odd\"\"name\" ON kv(updated_at)",
+        );
+        assert_has(
+            &refusal(&path),
+            &[
+                "kv: index my index: not created by this build",
+                "recovery for my index: `DROP INDEX \"my index\";`",
+                "kv: index odd\"name: not created by this build",
+                "recovery for odd\"name: `DROP INDEX \"odd\"\"name\";`",
+            ],
+        );
+    }
+
     #[test]
     fn an_index_on_other_columns_is_index_drift() {
         let (_dir, path) = edited(
@@ -496,7 +679,7 @@ mod tests {
             &msg,
             &[
                 "blocks: index idx_blocks_timestamp: definition differs",
-                "DROP INDEX idx_blocks_timestamp;",
+                "DROP INDEX \"idx_blocks_timestamp\";",
             ],
         );
         assert!(
@@ -517,7 +700,7 @@ mod tests {
             &refusal(&path),
             &[
                 "token_balances: index idx_tb_holding: definition differs",
-                "DROP INDEX idx_tb_holding;",
+                "DROP INDEX \"idx_tb_holding\";",
             ],
         );
     }
@@ -529,7 +712,7 @@ mod tests {
             &refusal(&path),
             &[
                 "kv: index idx_kv_value: not created by this build",
-                "DROP INDEX idx_kv_value;",
+                "DROP INDEX \"idx_kv_value\";",
             ],
         );
     }
