@@ -2,7 +2,8 @@
 //!
 //! - **Idempotence:** applying the file twice changes nothing.
 //! - **Parity:** the file describes what `init_db` creates, except for the
-//!   differences `ALLOWED` names.
+//!   differences `ALLOWED` names, and spells each expression or partial index
+//!   as `TRANSLATED` pins it.
 //! - **Round-trip:** every baseline fixture's rows survive a copy into it
 //!   unchanged.
 //!
@@ -59,6 +60,22 @@ const ALLOWED: &[(&str, &str, &str, &str, &str, &str)] = &[
         "declared BLOB on SQLite, but every row holds 0x text",
     ),
 ];
+
+/// The expression and partial indexes, which the engines spell differently:
+/// (index, its `sqlite_master.sql` from `init_db`, its `pg_get_indexdef` from
+/// `schema_pg.sql`, unqualified). Compared ignoring case and whitespace
+/// outside quotes, each side must match its pin, so a change to either fails
+/// until it is ported to the other and the entry updated. A comment or a
+/// redundant `ASC` in the definition counts as a change too.
+const TRANSLATED: &[(&str, &str, &str)] = &[(
+    "idx_tb_holding",
+    "CREATE INDEX idx_tb_holding
+     ON token_balances(token_addr, LENGTH(balance) DESC, balance DESC)
+     WHERE balance NOT LIKE '-%'",
+    "CREATE INDEX idx_tb_holding ON token_balances USING btree
+     (token_addr, length(balance) DESC, balance DESC)
+     WHERE (balance !~~ '-%'::text)",
+)];
 
 /// Row keys for the tables `SPECS` leaves out, which the round-trip copies too.
 const UNINDEXED: &[Spec] = &[
@@ -262,8 +279,12 @@ struct Idx {
     unique: bool,
     partial: bool,
     /// Key columns with direction, or `None` for an expression or partial
-    /// index, whose text differs between engines by design.
+    /// index, whose text differs between engines by design: `definition`
+    /// holds it instead.
     keys: Option<Vec<String>>,
+    /// The whole definition of an expression or partial index, as the engine
+    /// reports it, for `TRANSLATED`.
+    definition: Option<String>,
 }
 
 #[derive(Default)]
@@ -378,6 +399,14 @@ fn sqlite_shape(conn: &Connection) -> Shape {
                     keys.insert(key("unique", &names));
                 }
                 "c" => {
+                    let definition = (expression || partial).then(|| {
+                        conn.query_row(
+                            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                            [&index],
+                            |r| r.get(0),
+                        )
+                        .unwrap()
+                    });
                     shape.indexes.insert(
                         index,
                         Idx {
@@ -385,6 +414,7 @@ fn sqlite_shape(conn: &Connection) -> Shape {
                             unique,
                             partial,
                             keys: (!expression && !partial).then_some(names),
+                            definition,
                         },
                     );
                 }
@@ -457,7 +487,11 @@ async fn pg_shape(conn: &mut PgConnection) -> Shape {
                       FROM generate_series(0, i.indnkeyatts - 1) k
                       LEFT JOIN pg_attribute a
                         ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
-                      ORDER BY k)
+                      ORDER BY k),
+                -- Always qualified by the scratch schema, whose name is the
+                -- test's own; drop it.
+                replace(pg_get_indexdef(i.indexrelid),
+                        quote_ident(current_schema()) || '.', '')
          FROM pg_index i
          JOIN pg_class ic ON ic.oid = i.indexrelid
          JOIN pg_class tc ON tc.oid = i.indrelid
@@ -477,6 +511,7 @@ async fn pg_shape(conn: &mut PgConnection) -> Shape {
                 unique: row.get(2),
                 partial,
                 keys: (!expression && !partial).then(|| row.get(5)),
+                definition: (expression || partial).then(|| row.get(6)),
             },
         );
     }
@@ -637,6 +672,81 @@ fn compare(sqlite: &Shape, pg: &Shape) -> Vec<Diff> {
     out
 }
 
+/// Lowercase, with whitespace dropped outside string literals, as
+/// `src/db/schema_check.rs` compares definitions.
+fn normalize(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut quoted = false;
+    for c in sql.chars() {
+        if c == '\'' {
+            quoted = !quoted;
+        }
+        if quoted || c == '\'' {
+            out.push(c);
+        } else if !c.is_whitespace() {
+            out.extend(c.to_lowercase());
+        }
+    }
+    out
+}
+
+/// Every expression or partial index whose definition on either side is not
+/// the one `TRANSLATED` pins, or that has no entry, and every entry that no
+/// longer names one of `init_db`'s.
+fn untranslated(sqlite: &Shape, pg: &Shape) -> Vec<String> {
+    let definition = |shape: &Shape, name: &str| -> Option<String> {
+        shape.indexes.get(name)?.definition.clone()
+    };
+    let mut out = Vec::new();
+    let names: BTreeSet<&String> = sqlite
+        .indexes
+        .iter()
+        .chain(&pg.indexes)
+        .filter(|(_, i)| i.definition.is_some())
+        .map(|(name, _)| name)
+        .collect();
+    for name in names {
+        let table = &sqlite
+            .indexes
+            .get(name)
+            .or(pg.indexes.get(name))
+            .unwrap()
+            .table;
+        let what = format!("{table}.index {name}");
+        let Some(&(_, s_pin, p_pin)) = TRANSLATED.iter().find(|t| t.0 == name) else {
+            let show = |shape| definition(shape, name).unwrap_or_else(|| "none".into());
+            out.push(format!(
+                "{what}: an expression or partial index; add it to TRANSLATED: init_db {}, \
+                 schema_pg.sql {}",
+                show(sqlite),
+                show(pg)
+            ));
+            continue;
+        };
+        if let Some(s) = definition(sqlite, name).filter(|s| normalize(s) != normalize(s_pin)) {
+            out.push(format!(
+                "{what}: init_db definition changed; port it to schema_pg.sql and update \
+                 TRANSLATED: {s}"
+            ));
+        }
+        if let Some(p) = definition(pg, name).filter(|p| normalize(p) != normalize(p_pin)) {
+            out.push(format!(
+                "{what}: schema_pg.sql definition differs from TRANSLATED: {p}"
+            ));
+        }
+    }
+    for t in TRANSLATED {
+        if definition(sqlite, t.0).is_none() {
+            out.push(format!(
+                "TRANSLATED entry {:?} no longer names an expression or partial index of \
+                 init_db; remove it",
+                t.0
+            ));
+        }
+    }
+    out
+}
+
 #[tokio::test]
 #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
 async fn schema_pg_matches_init_db() {
@@ -646,7 +756,8 @@ async fn schema_pg_matches_init_db() {
 
     let mut pg = scratch("parity").await;
     pg.apply_schema().await;
-    let diffs = compare(&sqlite, &pg_shape(&mut pg.conn).await);
+    let postgres = pg_shape(&mut pg.conn).await;
+    let diffs = compare(&sqlite, &postgres);
 
     let mut problems: Vec<String> = diffs
         .iter()
@@ -665,6 +776,7 @@ async fn schema_pg_matches_init_db() {
             ));
         }
     }
+    problems.extend(untranslated(&sqlite, &postgres));
     problems.extend(uncollated(&mut pg.conn).await);
     assert!(
         problems.is_empty(),
