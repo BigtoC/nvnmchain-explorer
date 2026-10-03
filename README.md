@@ -39,13 +39,13 @@ All of the options below give you a platform subdomain with TLS — no domain
 registration needed. If you already own a domain you can point a subdomain at
 any of them instead.
 
-| Provider | Cost (approx.) | Subdomain | Notes |
-|----------|----------------|-----------|-------|
-| **Fly.io** (recommended) | ~$2/mo, free tier often covers it | `<app>.fly.dev` | Managed PaaS, 1 GB persistent volume, `fly.toml` included |
-| **Railway** | $5/mo base (includes $5 usage) | `<app>.up.railway.app` | Same Dockerfile, volumes supported |
-| **Render** | $7/mo Starter + ~$0.25/GB disk | `<app>.onrender.com` | `render.yaml` included; must be paid (always-on) |
-| **Hetzner Cloud** | ~€4–5/mo VPS | your own or IP only | Full VM, real disk, `deploy/install.sh` + systemd included |
-| **Oracle Cloud Always Free** | $0 | public IP only | 4-OCPU ARM VM; free forever but more setup + capacity limits |
+| Provider                     | Cost (approx.)                    | Subdomain              | Notes                                                        |
+|------------------------------|-----------------------------------|------------------------|--------------------------------------------------------------|
+| **Fly.io** (recommended)     | ~$2/mo, free tier often covers it | `<app>.fly.dev`        | Managed PaaS, 1 GB persistent volume, `fly.toml` included    |
+| **Railway**                  | $5/mo base (includes $5 usage)    | `<app>.up.railway.app` | Same Dockerfile, volumes supported                           |
+| **Render**                   | $7/mo Starter + ~$0.25/GB disk    | `<app>.onrender.com`   | `render.yaml` included; must be paid (always-on)             |
+| **Hetzner Cloud**            | ~€4–5/mo VPS                      | your own or IP only    | Full VM, real disk, `deploy/install.sh` + systemd included   |
+| **Oracle Cloud Always Free** | $0                                | public IP only         | 4-OCPU ARM VM; free forever but more setup + capacity limits |
 
 ### Managed PaaS (Fly.io)
 
@@ -81,10 +81,10 @@ Starter, deploy.
   database; the container entrypoint (`deploy/entrypoint.sh`) fixes volume
   ownership on boot so the app user can write to it regardless of how the
   provider mounts empty volumes.
-- **Migrations run automatically** — on every boot `init_db` applies pending
-  schema migrations tracked by SQLite's `PRAGMA user_version`. Deploying a new
-  binary over an old database upgrades it in place (additive `ALTER TABLE`
-  steps, logged at startup); legacy databases also get a one-time rebuild of
+- **Migrations run automatically** — on every boot `init_db` applies
+  idempotent DDL (`CREATE … IF NOT EXISTS`, `DROP … IF EXISTS`); a changed
+  column or key on an existing table makes the explorer refuse to start and
+  name the table (see `docs/database.md`); legacy databases also get a one-time rebuild of
   the incremental token-balance table, and their anchoring events read back
   from the node's logs.
 - **Volume sizing** — a full backfill of this chain is ~1.2 GB of raw block
@@ -128,39 +128,39 @@ The indexer is built for a sub-second chain:
 
 ## Configuration (env vars)
 
-| Var | Default | Meaning |
-|-----|---------|---------|
-| `NVNM_RPC` | `https://rpc.nvnm.canary.mantrachain.dev` | JSON-RPC endpoint (legacy `TEMPO_RPC` also accepted) |
-| `WS_URL` | `wss://ws.nvnm.canary.mantrachain.dev` | WebSocket endpoint for `newHeads` |
-| `INDEX_WS` | `1` | Set `0` to disable the WebSocket feed (pure polling) |
-| `CHAIN_ID` | `787222` | Chain id shown in the UI |
-| `DB_PATH` | `explorer.db` | SQLite database path |
-| `HOST` / `PORT` | `0.0.0.0` / `8080` | Bind address |
-| `INDEX_POLL_SECONDS` | `1` | Poll interval when the WebSocket feed is unavailable |
-| `INDEX_BATCH` | `5` | Blocks indexed per cycle (forward + backfill) |
-| `INDEX_CONCURRENCY` | `32` | Blocks fetched in parallel |
-| `NATIVE_SYMBOL` | `OM` | Symbol shown for native (burnt/gas) amounts |
-| `STATS_INTERVAL_SECONDS` | `5` | How often the dashboard stats are recomputed |
-| `SIGNATURE_LOOKUP_URL` | OpenChain | Signature directory for selectors no built-in ABI declares; set empty to disable ([Decoding](#decoding)) |
-| `RUST_LOG` | `nvnmchain_explorer=info` | Log verbosity |
+| Var                      | Default                                   | Meaning                                                                                                  |
+|--------------------------|-------------------------------------------|----------------------------------------------------------------------------------------------------------|
+| `NVNM_RPC`               | `https://rpc.nvnm.canary.mantrachain.dev` | JSON-RPC endpoint (legacy `TEMPO_RPC` also accepted)                                                     |
+| `WS_URL`                 | `wss://ws.nvnm.canary.mantrachain.dev`    | WebSocket endpoint for `newHeads`                                                                        |
+| `INDEX_WS`               | `1`                                       | Set `0` to disable the WebSocket feed (pure polling)                                                     |
+| `CHAIN_ID`               | `787222`                                  | Chain id shown in the UI                                                                                 |
+| `DB_PATH`                | `explorer.db`                             | SQLite database path                                                                                     |
+| `HOST` / `PORT`          | `0.0.0.0` / `8080`                        | Bind address                                                                                             |
+| `INDEX_POLL_SECONDS`     | `1`                                       | Poll interval when the WebSocket feed is unavailable                                                     |
+| `INDEX_BATCH`            | `5`                                       | Blocks indexed per cycle (forward + backfill)                                                            |
+| `INDEX_CONCURRENCY`      | `32`                                      | Blocks fetched in parallel                                                                               |
+| `NATIVE_SYMBOL`          | `OM`                                      | Symbol shown for native (burnt/gas) amounts                                                              |
+| `STATS_INTERVAL_SECONDS` | `5`                                       | How often the dashboard stats are recomputed                                                             |
+| `SIGNATURE_LOOKUP_URL`   | OpenChain                                 | Signature directory for selectors no built-in ABI declares; set empty to disable ([Decoding](#decoding)) |
+| `RUST_LOG`               | `nvnmchain_explorer=info`                 | Log verbosity                                                                                            |
 
 ## Routes
 
-| Path | Description |
-|------|-------------|
-| `/` | Dashboard (stats, recent blocks/txs) |
-| `/block/{num\|hash}` | Block detail |
-| `/blocks` | Block list |
-| `/tx/{hash}` | Transaction detail (tabs: Overview/Balances/Calls/Events/Raw) |
-| `/address/{addr}` | Address info (transactions, transfers, holdings, contract) |
-| `/token/{addr}` | Token metadata, transfers, and holders |
-| `/tokens` | Token list |
-| `/anchoring` | Anchoring registries; `?q=` finds an id, an exact name or a checksum |
-| `/anchoring/{registry}` | A registry and the latest version of each record |
-| `/anchoring/{registry}/{record}` | A record's versions |
-| `/search?q=...` | Smart redirect (block#/tx/address/token auto-detection) |
-| `/api/search?q=...` | Suggestions for the search box, answered from the index |
-| `/api/events` | SSE live feed — pushes each newly indexed tip block (drives the home page's streaming "Latest Blocks" panel) |
+| Path                             | Description                                                                                                  |
+|----------------------------------|--------------------------------------------------------------------------------------------------------------|
+| `/`                              | Dashboard (stats, recent blocks/txs)                                                                         |
+| `/block/{num\|hash}`             | Block detail                                                                                                 |
+| `/blocks`                        | Block list                                                                                                   |
+| `/tx/{hash}`                     | Transaction detail (tabs: Overview/Balances/Calls/Events/Raw)                                                |
+| `/address/{addr}`                | Address info (transactions, transfers, holdings, contract)                                                   |
+| `/token/{addr}`                  | Token metadata, transfers, and holders                                                                       |
+| `/tokens`                        | Token list                                                                                                   |
+| `/anchoring`                     | Anchoring registries; `?q=` finds an id, an exact name or a checksum                                         |
+| `/anchoring/{registry}`          | A registry and the latest version of each record                                                             |
+| `/anchoring/{registry}/{record}` | A record's versions                                                                                          |
+| `/search?q=...`                  | Smart redirect (block#/tx/address/token auto-detection)                                                      |
+| `/api/search?q=...`              | Suggestions for the search box, answered from the index                                                      |
+| `/api/events`                    | SSE live feed — pushes each newly indexed tip block (drives the home page's streaming "Latest Blocks" panel) |
 
 All data endpoints accept `?format=json` or `Accept: application/json`.
 
