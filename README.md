@@ -155,11 +155,12 @@ The indexer is built for a sub-second chain:
 | `/address/{addr}` | Address info (transactions, transfers, holdings, contract) |
 | `/token/{addr}` | Token metadata, transfers, and holders |
 | `/tokens` | Token list |
-| `/anchoring` | Anchoring registries; `?q=` finds an id, an exact name or a checksum |
+| `/anchoring` | Anchoring registries; `?q=` finds an id, a name or a checksum |
 | `/anchoring/{registry}` | A registry and the latest version of each record |
 | `/anchoring/{registry}/{record}` | A record's versions |
 | `/search?q=...` | Smart redirect (block#/tx/address/token auto-detection) |
 | `/api/search?q=...` | Suggestions for the search box, answered from the index |
+| `/api/anchoring/search?q=...` | Suggestions for the anchoring page's field |
 | `/api/events` | SSE live feed — pushes each newly indexed tip block (drives the home page's streaming "Latest Blocks" panel) |
 
 All data endpoints accept `?format=json` or `Accept: application/json`.
@@ -190,7 +191,7 @@ The anchoring pages read that contract over RPC, not the index: the corpus it
 was seeded with at genesis emitted no events. So does the search box, for a whole
 registry name or a record's checksum — all the contract matches. Any part of a name
 matches only in the node's registry name index: start the node with
-`--anchoring.name-index` and the box asks it, at a request per keystroke. A node without
+`--anchoring.name-index` and the box and the anchoring page ask it. A node without
 it answers "method not found", which costs the box those rows and nothing else.
 
 Each decoded log is also said in words, from the phrasing table in
@@ -258,7 +259,7 @@ src/
   summary.rs    what a transaction did, in a sentence
   memo.rs       TIP-20 transfer memos
   signatures.rs names for selectors no built-in ABI declares
-  name_search.rs  registry names from nvnmchain-anchoring, when one is configured
+  name_search.rs  registry names from the node's name index, when it runs one
   tempo_address.rs  TIP-1022 virtual addresses
   contracts.rs  precompile / token labels
   anchoring.rs  the anchoring contract's views
