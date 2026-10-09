@@ -276,6 +276,7 @@ async fn web_api_serves_indexed_data() {
     index_block(&rpc, &db, head).await.expect("index tip");
 
     let cfg = nvnmchain_explorer::config::Settings {
+        role: nvnmchain_explorer::config::Role::All,
         rpc_url: DEFAULT_RPC_URL.into(),
         ws_url: String::new(),
         index_ws: false,
