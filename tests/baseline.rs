@@ -39,12 +39,17 @@ use serde_json::{json, Value};
 
 /// Canary's first Transfer (102504); 26 anchoring writes, the failed tx at
 /// 105627 and three contract deploys; a TIP-20 token's creation, role grant
-/// and first mint; and legacy, EIP-1559 and 0x76 transactions side by side.
-const RANGES: [RangeInclusive<u64>; 4] = [
+/// and first mint; legacy, EIP-1559 and 0x76 transactions side by side; and
+/// every transaction touching contract 0xDF0555AFd6573Ad1426ACa5f834A3E1bfee71a49
+/// up to block 3033001: its CREATE2 deploy and two 0x76 calls that emit its event.
+const RANGES: [RangeInclusive<u64>; 7] = [
     102_500..=102_510,
     105_465..=105_640,
+    1_419_680..=1_419_680,
     1_442_885..=1_442_930,
     1_445_775..=1_445_945,
+    1_549_393..=1_549_393,
+    1_561_424..=1_561_424,
 ];
 
 /// Blocks fetched at once, and blocks per commit.
