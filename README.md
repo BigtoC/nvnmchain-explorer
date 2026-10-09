@@ -125,8 +125,12 @@ The indexer is built for a sub-second chain:
 
 ## Configuration (env vars)
 
+For local development, copy `.env.example` to `.env`; it is loaded at startup
+and never overrides variables already set in the environment.
+
 | Var | Default | Meaning |
 |-----|---------|---------|
+| `ROLE` | `ALL` | `ALL`, `INDEXER` or `WEB`; informational for now (logged at startup, every role still runs indexer and server) |
 | `NVNM_RPC` | `https://rpc.nvnm.canary.mantrachain.dev` | JSON-RPC endpoint (legacy `TEMPO_RPC` also accepted) |
 | `WS_URL` | `wss://ws.nvnm.canary.mantrachain.dev` | WebSocket endpoint for `newHeads` |
 | `INDEX_WS` | `1` | Set `0` to disable the WebSocket feed (pure polling) |
