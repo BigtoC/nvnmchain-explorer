@@ -1,0 +1,39 @@
+# Local PostgreSQL for the explorer's Postgres port.
+#
+#   docker compose up -d
+#   psql postgres://explorer:explorer@localhost:5432/explorer
+#
+# A fresh volume runs src/db/schema_pg.sql once on first start. Rerunning it
+# with psql only adds missing tables and indexes; to pick up a changed
+# definition, start over with `docker compose down -v`.
+#
+# Override any default from the shell or a .env file next to this one:
+# POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, POSTGRES_PORT.
+
+services:
+  postgres:
+    image: postgres:18.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-explorer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-explorer}
+      POSTGRES_DB: ${POSTGRES_DB:-explorer}
+    ports:
+      # Loopback only: the default credentials are well known.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # From 18 the image keeps its data under /var/lib/postgresql/18/docker
+      # and expects the volume on the parent directory.
+      - pgdata:/var/lib/postgresql
+      - ./src/db/schema_pg.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      # Over TCP: initdb scripts run on a socket-only temporary server, so a
+      # socket check would pass before the schema is loaded.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  pgdata:
