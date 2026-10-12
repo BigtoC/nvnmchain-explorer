@@ -1,29 +1,70 @@
-//! Data correctness against a baseline database, with no network.
+//! Checks that the explorer stores the same data as a saved baseline database.
+//! It needs no network.
 //!
-//! Two fixtures, both written from the live chain by `record_baseline`:
+//! There are two fixture files. `record_baseline` writes both from the live chain:
 //!
-//! - `fixtures/baseline/canary-rpc.json`: every JSON-RPC answer the explorer
-//!   was given for `RANGES`, keyed by method and params, and every signature
-//!   directory answer, keyed by query.
-//! - `fixtures/baseline/canary.db`: the SQLite database it wrote from them.
+//! - `fixtures/baseline/canary-rpc.json`: the recorded answers. It has every
+//!   JSON-RPC answer the explorer got for the blocks in `RANGES`, and every
+//!   answer from the signature directory.
+//! - `fixtures/baseline/canary.db`: the baseline database. It is what the
+//!   explorer wrote from those answers.
 //!
-//! `replay_reproduces_baseline` serves the recorded answers from a local stub
-//! node, runs the same writes into a fresh database, and compares every table
-//! row by row. Anything that differs is a change in what the explorer stores,
-//! which a refactor or a new database backend must not make. A table left
-//! empty or a column left NULL throughout fails too, unless `UNEXERCISED`
-//! says why, so a new table cannot go uncompared.
+//! # How the test works
 //!
-//! To write the database again from the build checked out, recording only
-//! the answers the tape lacks:
+//! `replay_reproduces_baseline` does these steps:
+//!
+//! 1. It starts a fake node on a local port. The fake node answers from the recorded answers。
+//!    If the explorer asks for something that was not recorded, the test fails and names the request.
+//! 2. It runs the explorer's writes into a new, empty database (see `index`).
+//!    It saves the blocks in `RANGES`, runs the genesis balance pass, and looks
+//!    up function names like a page does.
+//! 3. It checks that every table in the baseline has rows, and every column has at least one value
+//!    that is not NULL. If not, the test fails, because an empty table or column checks nothing.
+//!    The only exceptions are listed in `UNEXERCISED`, each with a reason.
+//! 4. It compares every table in the 2 databases row by row (see `compare`). There is no list of
+//!    tables to compare: it reads the table names from SQLite, so a new table is compared too.
+//!    Columns in the `VOLATILE` array are excluded because they are the clock at write time.
+//!
+//! If anything is different, the explorer now stores different data.
+//! A refactor or a new database backend must not do that.
+//!
+//! # Table coverage
+//!
+//! The rows in the current baseline, and the code that writes them:
+//!
+//! | Table              | Rows | Written by                                       |
+//! |--------------------|------|--------------------------------------------------|
+//! | `blocks`           |  407 | saving blocks                                    |
+//! | `transactions`     |   61 | saving blocks: legacy, EIP-1559 and 0x76 transactions; 1 failed, 3 contract deploys |
+//! | `transfer_events`  |   86 | saving blocks: `Transfer` logs in receipts       |
+//! | `anchoring_events` |   26 | saving blocks: logs from the anchoring contract  |
+//! | `token_metadata`   |    3 | saving blocks: token name, symbol, supply, holder count |
+//! | `token_balances`   |   30 | saving blocks, then the genesis balance pass     |
+//! | `genesis_balances` |   29 | genesis balance pass: each holder's balance at block 0 |
+//! | `counters`         |    2 | saving blocks: block and transaction counts      |
+//! | `kv`               |    1 | genesis balance pass: `genesis_balances_cursor`  |
+//! | `selector_names`   |    7 | function name lookup: 1 name found, 6 not found  |
+//! | `sqlite_sequence`  |    1 | SQLite, for the `transfer_events` ids            |
+//!
+//! Not covered:
+//!
+//! - `transactions.trace_data`: see `UNEXERCISED`.
+//! - The `kv` keys the live loops write (`stats`, `chain_head`,
+//!   `anchoring_backfilled_to`). Their values depend on the clock or on the
+//!   chain's current head, so they change on every run.
+//!
+//! # Recording
+//!
+//! This command writes the baseline database again with the current code. It
+//! keeps the answers already recorded and only records the missing ones:
 //!
 //! ```text
 //! cargo test --test baseline record_baseline -- --ignored --nocapture
 //! ```
 //!
-//! The chain is only asked when the tape is deleted first (`NVNM_RPC` picks
-//! the node). Canary was reset on 2026-10-09: the blocks on the tape, and the
-//! contract `RANGES` follows, no longer exist on it.
+//! It only asks the chain if you delete `canary-rpc.json` first. `NVNM_RPC`
+//! picks the node. Canary was reset on 2026-10-09, so the recorded blocks, and
+//! the contract in `RANGES`, are no longer on the chain.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
@@ -289,6 +330,8 @@ async fn index(url: &str, db: &Db) -> anyhow::Result<()> {
 
 /// Every table's compared columns and rows, each row rendered and sorted.
 fn dump(conn: &Connection) -> BTreeMap<String, (Vec<String>, Vec<String>)> {
+    // Read the table names from SQLite instead of a fixed list, so a table
+    // added to `init_db` is compared too.
     let tables: Vec<String> = conn
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
         .unwrap()
