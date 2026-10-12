@@ -34,14 +34,8 @@
 -- * Type the placeholder NULLs in TX_LIST_COLS (NULL::bytea, NULL::text,
 --   NULL::text): an untyped NULL column is text, which a bytea read rejects.
 -- * Bind every LIMIT/OFFSET as i64; get_anchoring_events passes a u32.
--- * NUMERIC columns (transfer_events.amount, token_balances.balance) bind as
---   $n::text::numeric and select as col::text; Rust holds them as decimal
---   Strings, and the drivers will not bind a String to a numeric parameter.
--- * decode_uint256_result should read only the first ABI word: it decodes the
---   whole return data, so a contract can hand back a number past NUMERIC's
---   131072 digits, and a genesis balance that size fails token_balances.
 -- * Token-name compares fold under "C": get_token_by_symbol_or_name's
---   lower(col) = lower($1) and search_tokens' `symbol = ?1 COLLATE NOCASE`
+--   lower(col) = lower($1) and search_tokens' `symbol = ?1 COLLATE NOCASE`decode_uint256_result.
 --   (PostgreSQL has no NOCASE) both become lower(col) = lower($1 COLLATE "C");
 --   a plain lower($1) folds under the database locale.
 -- * search_tokens' LIKE becomes ILIKE, run unprepared or with
@@ -50,8 +44,6 @@
 --   get_address_transfer_count) split `from_addr=$1 OR to_addr=$1` into
 --   count(from_addr=$1) + count(to_addr=$1 AND from_addr<>$1); the OR form
 --   reads every matching heap page.
--- * HOLDING is exactly `balance >= 0`, and get_token_holders orders by
---   `token_balances.balance DESC`, qualified (see idx_tb_holding).
 -- * get_transactions selects its page's keys first and joins for the
 --   columns (see idx_tx_block_position).
 
@@ -182,9 +174,13 @@ CREATE TABLE IF NOT EXISTS transfer_events (
     token_addr BYTEA NOT NULL,
     from_addr BYTEA NOT NULL,
     to_addr BYTEA NOT NULL,
-    -- A decoded uint256 (always base-10 digits), which 78 digits hold.
-    -- Select it as amount::text: no Rust decimal type holds a uint256.
-    amount NUMERIC(78, 0) NOT NULL,
+    -- Text, as in SQLite: a business decision, not a type limit. It is a
+    -- decoded uint256 (base-10 digits, 78 at most), which NUMERIC(78, 0)
+    -- would hold, and nothing in SQL sums, compares or sorts it today.
+    -- TODO(postgres): review this choice once PostgreSQL support is fully
+    -- implemented (NUMERIC would type-check values and allow SQL arithmetic,
+    -- at the cost of $n::text::numeric binds and amount::text reads).
+    amount TEXT NOT NULL,
     timestamp BIGINT NOT NULL DEFAULT 0,
     created_at BIGINT NOT NULL DEFAULT 0,
     UNIQUE (block_number, log_index)
@@ -257,10 +253,13 @@ CREATE TABLE IF NOT EXISTS token_balances (
     -- Signed: 0x00..00 holds minus the net minted (every mint debits it, and
     -- the genesis pass skips it), and a holder funded before indexing began,
     -- or at genesis until the genesis pass adds it, reads negative.
-    -- Never 0 (such rows are deleted). A running sum over events any
-    -- contract can emit, so no precision cap: an overflow would abort the
-    -- block's transaction and stall the indexer. Select it as balance::text.
-    balance NUMERIC NOT NULL DEFAULT 0,
+    -- Never 0 (such rows are deleted). Decimal text, as in SQLite: a
+    -- business decision, as for transfer_events.amount. "C" so the digit
+    -- compares in idx_tb_holding are byte compares.
+    -- TODO(postgres): review this choice once PostgreSQL support is fully
+    -- implemented (NUMERIC would order itself, making HOLDING `balance >= 0`
+    -- and the holders order plain `balance DESC`).
+    balance TEXT COLLATE "C" NOT NULL DEFAULT '0',
     updated_at BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (token_addr, holder_addr)
 );
@@ -268,17 +267,14 @@ CREATE TABLE IF NOT EXISTS token_balances (
 CREATE INDEX IF NOT EXISTS idx_tb_holder ON token_balances (holder_addr);
 -- The holdings of one token, in listing order: holder counts
 -- (upsert_token_meta, count_holders) are index scans and the holders page
--- (get_token_holders) needs no sort. NUMERIC orders itself, so SQLite's
--- LENGTH(balance) DESC, balance DESC becomes balance DESC, and HOLDING
--- (`balance NOT LIKE '-%'`) becomes `balance >= 0`. A partial index only
--- serves queries whose filter provably implies its own, so HOLDING in db.rs
--- must be exactly `balance >= 0` and the holders page must ORDER BY balance
--- DESC. Qualify it there: beside
--- `SELECT balance::text`, a bare ORDER BY balance names that text output
--- column, which sorts as text and loses the index.
+-- (get_token_holders) needs no sort: a longer digit string is a larger
+-- holding, and equal lengths compare digit by digit. Built from HOLDING
+-- itself, as in SQLite: a partial index only serves queries whose filter
+-- provably implies its own, so HOLDING in db.rs stays exactly
+-- `balance NOT LIKE '-%'`.
 CREATE INDEX IF NOT EXISTS idx_tb_holding
-    ON token_balances (token_addr, balance DESC)
-    WHERE balance >= 0;
+    ON token_balances (token_addr, LENGTH(balance) DESC, balance DESC)
+    WHERE balance NOT LIKE '-%';
 
 -- Each seen holder's balance at genesis, zero included: no event carries it.
 -- Text keys as in token_balances, which the rebuild feeds them into.
