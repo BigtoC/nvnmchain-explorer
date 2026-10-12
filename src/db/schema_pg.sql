@@ -3,8 +3,10 @@
 -- idx_transfer_tx_hash, see transfer_events), so the Rust layer ports as a
 -- driver swap plus the SQL notes below.
 --
--- Idempotent: safe to run on every start, and docker-compose.yml mounts it
--- into /docker-entrypoint-initdb.d for a fresh volume. A fresh schema only:
+-- Idempotent: safe to rerun as the role that owns the tables (a least-
+-- privilege app role cannot: CREATE ... IF NOT EXISTS checks privileges
+-- before existence). docker-compose.yml mounts it into
+-- /docker-entrypoint-initdb.d for a fresh volume. A fresh schema only:
 -- the SQLite DROPs for long-retired tables and indexes are not carried over.
 --
 -- Conventions, as in SQLite:
@@ -25,13 +27,33 @@
 --   target named: transfer_events also has the id key.
 -- * add_to_counter's `SET n = n + excluded.n` is ambiguous in PostgreSQL;
 --   write `SET n = counters.n + excluded.n`.
--- * EXISTS is boolean and SUM(bigint) is numeric here; cast where Rust reads i64.
--- * NUMERIC columns (amount, total_supply, both balance columns) bind as
+-- * Result types differ: EXISTS is boolean, SUM(bigint) and anything times
+--   1.0 are numeric, SUM(int) is bigint. Cast to bigint where Rust reads i64
+--   and to float8 where it reads f64 (both gas sums in compute_and_store_stats,
+--   whose unwrap_or would otherwise turn the decode error into zero stats).
+-- * Type the placeholder NULLs in TX_LIST_COLS (NULL::bytea, NULL::text,
+--   NULL::text): an untyped NULL column is text, which a bytea read rejects.
+-- * Bind every LIMIT/OFFSET as i64; get_anchoring_events passes a u32.
+-- * NUMERIC columns (transfer_events.amount, token_balances.balance) bind as
 --   $n::text::numeric and select as col::text; Rust holds them as decimal
 --   Strings, and the drivers will not bind a String to a numeric parameter.
--- * Collate the bound side of a token-name compare too: lower($1 COLLATE "C"),
---   or lower($1) folds under the database locale and stops matching what
---   lower(symbol) folds under "C".
+-- * decode_uint256_result should read only the first ABI word: it decodes the
+--   whole return data, so a contract can hand back a number past NUMERIC's
+--   131072 digits, and a genesis balance that size fails token_balances.
+-- * Token-name compares fold under "C": get_token_by_symbol_or_name's
+--   lower(col) = lower($1) and search_tokens' `symbol = ?1 COLLATE NOCASE`
+--   (PostgreSQL has no NOCASE) both become lower(col) = lower($1 COLLATE "C");
+--   a plain lower($1) folds under the database locale.
+-- * search_tokens' LIKE becomes ILIKE, run unprepared or with
+--   plan_cache_mode = force_custom_plan (see the trigram indexes).
+-- * The address counts (get_address_transaction_count,
+--   get_address_transfer_count) split `from_addr=$1 OR to_addr=$1` into
+--   count(from_addr=$1) + count(to_addr=$1 AND from_addr<>$1); the OR form
+--   reads every matching heap page.
+-- * HOLDING is exactly `balance >= 0`, and get_token_holders orders by
+--   `token_balances.balance DESC`, qualified (see idx_tb_holding).
+-- * get_transactions selects its page's keys first and joins for the
+--   columns (see idx_tx_block_position).
 
 -- Trigram indexes for the token search box; see token_metadata.
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
@@ -54,11 +76,14 @@ CREATE TABLE IF NOT EXISTS blocks (
     view BIGINT NOT NULL DEFAULT 0,
     proposer BYTEA NOT NULL DEFAULT '\x'::bytea,
     created_at BIGINT NOT NULL DEFAULT 0
-);
+-- An index-only scan skips the heap only on pages vacuum has marked
+-- all-visible, and the default insert trigger scales with the table: a
+-- fixed one keeps the newest rows, the ones the stats and pages read, marked.
+) WITH (autovacuum_vacuum_insert_scale_factor = 0,
+        autovacuum_vacuum_insert_threshold = 10000);
 -- The stats sum the last day's tx_count every few seconds and count its
 -- blocks (compute_and_store_stats in indexer.rs). INCLUDE makes both
--- index-only: a PostgreSQL index does not reach the row without a heap fetch
--- per block.
+-- index-only on vacuumed pages, rather than a heap fetch per block.
 CREATE INDEX IF NOT EXISTS idx_blocks_timestamp
     ON blocks (timestamp) INCLUDE (tx_count);
 
@@ -84,7 +109,9 @@ CREATE TABLE IF NOT EXISTS transactions (
     receipt_data TEXT,
     timestamp BIGINT NOT NULL DEFAULT 0,
     created_at BIGINT NOT NULL DEFAULT 0
-);
+-- Insert vacuum as on blocks, for the index-only address counts.
+) WITH (autovacuum_vacuum_insert_scale_factor = 0,
+        autovacuum_vacuum_insert_threshold = 50000);
 -- The address page walks each side newest first (get_address_transactions).
 -- The to-side also filters from_addr<>$1, and the address tx count
 -- (get_address_transaction_count) needs only these columns, so INCLUDE lets
@@ -94,13 +121,19 @@ CREATE INDEX IF NOT EXISTS idx_tx_from_block
     ON transactions (from_addr, block_number, position);
 CREATE INDEX IF NOT EXISTS idx_tx_to_block
     ON transactions (to_addr, block_number, position) INCLUDE (from_addr);
--- The chain-wide listing pages in this order, and a block's rows come off
--- it in position order.
+-- The chain-wide listing (get_transactions) pages in this order, and a
+-- block's rows come off it in position order. SQLite's deferred seek kept the
+-- walk to a deep OFFSET in the index; here the port must take the page's
+-- (block_number, position) off this index first, index-only, then join
+-- transactions for the columns, as the address page does, or every skipped
+-- row is a heap fetch.
 CREATE INDEX IF NOT EXISTS idx_tx_block_position
     ON transactions (block_number, position);
 
--- Rewritten every block that moves balances (holder_count), so pages are
--- left room for HOT updates; holder_count stays unindexed for the same reason.
+-- Updated whenever a block changes a token's net holder count
+-- (add_to_holder_counts), and re-upserted with its total_supply on every mint
+-- or burn (upsert_token_meta), so pages are left room for HOT updates;
+-- holder_count stays unindexed for the same reason.
 CREATE TABLE IF NOT EXISTS token_metadata (
     address BYTEA PRIMARY KEY,
     -- "C": byte order and ASCII-only case folding, as in SQLite (see header).
@@ -108,23 +141,26 @@ CREATE TABLE IF NOT EXISTS token_metadata (
     symbol TEXT COLLATE "C" NOT NULL DEFAULT '',
     decimals BIGINT NOT NULL DEFAULT 18,
     currency TEXT NOT NULL DEFAULT '',
-    -- Always a base-10 integer (decode_uint256_result), but of the whole
-    -- return data, which a nonstandard token can make longer than 32 bytes:
-    -- NUMERIC with no precision cap. Select it as total_supply::text.
-    total_supply NUMERIC NOT NULL DEFAULT 0,
+    -- Text, as in SQLite: decode_uint256_result reads the whole return data,
+    -- so any contract can make it longer than NUMERIC's 131072 digits, which
+    -- would fail the block's write. Nothing in SQL compares or sums it.
+    total_supply TEXT NOT NULL DEFAULT '0',
     logo_uri TEXT NOT NULL DEFAULT '',
     holder_count BIGINT NOT NULL DEFAULT 0,
     created_at BIGINT NOT NULL DEFAULT 0,
     updated_at BIGINT NOT NULL DEFAULT 0
 ) WITH (fillfactor = 80);
 -- Search on Enter: exact case-insensitive symbol or name
--- (get_token_by_symbol_or_name). The query text must be
--- lower(col) = lower($1 COLLATE "C") for these to match.
+-- (get_token_by_symbol_or_name). The index serves lower($1) either way;
+-- bind it as lower($1 COLLATE "C") so the term folds like the column.
 CREATE INDEX IF NOT EXISTS idx_token_symbol_lower ON token_metadata (lower(symbol));
 CREATE INDEX IF NOT EXISTS idx_token_name_lower ON token_metadata (lower(name));
 -- Typeahead per keystroke: substring match on symbol or name (search_tokens).
 -- SQLite's LIKE folds ASCII case and PostgreSQL's does not, so the port
--- writes ILIKE, which these serve; a leading % defeats any btree.
+-- writes ILIKE, which these serve for terms of 3+ characters; a leading %
+-- defeats any btree. A 2-character term yields no trigram, so a GIN scan
+-- reads the whole index: run the query with a custom plan, which picks a seq
+-- scan there, not a cached generic one.
 CREATE INDEX IF NOT EXISTS idx_token_symbol_trgm
     ON token_metadata USING gin (symbol gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_token_name_trgm
@@ -152,7 +188,9 @@ CREATE TABLE IF NOT EXISTS transfer_events (
     timestamp BIGINT NOT NULL DEFAULT 0,
     created_at BIGINT NOT NULL DEFAULT 0,
     UNIQUE (block_number, log_index)
-);
+-- Insert vacuum as on blocks, for the index-only transfer walks and counts.
+) WITH (autovacuum_vacuum_insert_scale_factor = 0,
+        autovacuum_vacuum_insert_threshold = 50000);
 -- SQLite's idx_transfer_tx_hash is not carried over: no query filters on
 -- tx_hash (the transfer pages join transactions on it, probing that table's
 -- key), and it would cost a btree insert on every transfer.
@@ -198,8 +236,10 @@ CREATE TABLE IF NOT EXISTS kv (
 ) WITH (fillfactor = 50);
 
 -- Row counts for the stats, kept by the writer. A COUNT(*) over
--- transactions is a scan of every row, on every stats refresh. Both rows
--- are updated in every block's transaction.
+-- transactions is a scan of every row, on every stats refresh. The writer
+-- bumps each row once per newly stored block (transactions only when the
+-- block adds some), so one batch transaction can update a row many times:
+-- room for HOT updates.
 CREATE TABLE IF NOT EXISTS counters (
     name TEXT PRIMARY KEY,
     n BIGINT NOT NULL DEFAULT 0
@@ -214,7 +254,9 @@ CREATE TABLE IF NOT EXISTS counters (
 CREATE TABLE IF NOT EXISTS token_balances (
     token_addr TEXT COLLATE "C" NOT NULL,
     holder_addr TEXT COLLATE "C" NOT NULL,
-    -- Signed: negative when indexing began after the holder was funded.
+    -- Signed: 0x00..00 holds minus the net minted (every mint debits it, and
+    -- the genesis pass skips it), and a holder funded before indexing began,
+    -- or at genesis until the genesis pass adds it, reads negative.
     -- Never 0 (such rows are deleted). A running sum over events any
     -- contract can emit, so no precision cap: an overflow would abort the
     -- block's transaction and stall the indexer. Select it as balance::text.
@@ -228,9 +270,10 @@ CREATE INDEX IF NOT EXISTS idx_tb_holder ON token_balances (holder_addr);
 -- (upsert_token_meta, count_holders) are index scans and the holders page
 -- (get_token_holders) needs no sort. NUMERIC orders itself, so SQLite's
 -- LENGTH(balance) DESC, balance DESC becomes balance DESC, and HOLDING
--- (`balance NOT LIKE '-%'`) becomes `balance >= 0`. A partial index only serves queries whose filter provably
--- implies its own, so HOLDING in db.rs must be exactly `balance >= 0` and the
--- holders page must ORDER BY balance DESC. Qualify it there: beside
+-- (`balance NOT LIKE '-%'`) becomes `balance >= 0`. A partial index only
+-- serves queries whose filter provably implies its own, so HOLDING in db.rs
+-- must be exactly `balance >= 0` and the holders page must ORDER BY balance
+-- DESC. Qualify it there: beside
 -- `SELECT balance::text`, a bare ORDER BY balance names that text output
 -- column, which sorts as text and loses the index.
 CREATE INDEX IF NOT EXISTS idx_tb_holding
@@ -242,8 +285,9 @@ CREATE INDEX IF NOT EXISTS idx_tb_holding
 CREATE TABLE IF NOT EXISTS genesis_balances (
     token_addr TEXT COLLATE "C" NOT NULL,
     holder_addr TEXT COLLATE "C" NOT NULL,
-    -- balanceOf decoded like total_supply (whole return data): uncapped.
-    balance NUMERIC NOT NULL,
+    -- balanceOf decoded like total_supply (whole return data): text, as in
+    -- SQLite, for the same reason. Only Rust reads it.
+    balance TEXT NOT NULL,
     PRIMARY KEY (token_addr, holder_addr)
 );
 
