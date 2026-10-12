@@ -226,7 +226,7 @@ holder counts and address holdings stay exact without rescanning history.
 
 ```bash
 # Unit and integration tests (no network)
-cargo test --lib --test decoder --test anchoring --test pages
+cargo test --lib --test decoder --test anchoring --test pages --test baseline
 
 # Integration tests against the live chain RPC
 cargo test --test live_rpc
@@ -237,6 +237,13 @@ real templates, so a context key a handler stops sending fails a test rather
 than a page view. Nothing in it reaches the network: the RPC points at a closed
 port and the signature directory is stubbed. `tests/anchoring.rs` does the same
 over a stub node that answers like the anchoring contract.
+
+`tests/baseline.rs` replays JSON-RPC answers recorded from canary
+(`fixtures/baseline/canary-rpc.json`) through the indexer and compares every
+table it writes, row by row, with the SQLite database the same answers produced
+when they were recorded (`fixtures/baseline/canary.db`). A change in what the
+explorer stores fails it. To record both again, delete them and run
+`cargo test --test baseline record_baseline -- --ignored --nocapture`.
 
 The live tests hit the RPC: they assert the chain id, fetch and index recent
 blocks into a temp SQLite DB, and boot the HTTP API to verify the JSON
