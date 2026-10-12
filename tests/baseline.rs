@@ -23,7 +23,7 @@
 //!    The only exceptions are listed in `UNEXERCISED`, each with a reason.
 //! 4. It compares every table in the 2 databases row by row (see `compare`). There is no list of
 //!    tables to compare: it reads the table names from SQLite, so a new table is compared too.
-//!    Columns in the `VOLATILE` array are excluded because they are the clock at write time.
+//!    Columns in the `EXCLUDED_COLUMNS` are excluded because they are the clock at write time.
 //!
 //! If anything is different, the explorer now stores different data.
 //! A refactor or a new database backend must not do that.
@@ -110,7 +110,7 @@ const COMMIT: usize = 64;
 
 /// Wall-clock write times: the only values two runs over the same answers
 /// may disagree on.
-const VOLATILE: &[&str] = &["created_at", "updated_at", "fetched_at"];
+const EXCLUDED_COLUMNS: &[&str] = &["created_at", "updated_at", "fetched_at"];
 
 /// What the baseline leaves empty, and why: writes no recorded answer drives.
 const UNEXERCISED: &[(&str, &str)] = &[(
@@ -347,7 +347,7 @@ fn dump(conn: &Connection) -> BTreeMap<String, (Vec<String>, Vec<String>)> {
             .query_map([&table], |r| r.get(0))
             .unwrap()
             .map(Result::unwrap)
-            .filter(|c: &String| !VOLATILE.contains(&c.as_str()))
+            .filter(|c: &String| !EXCLUDED_COLUMNS.contains(&c.as_str()))
             .collect();
         let list: Vec<String> = cols.iter().map(|c| format!("\"{c}\"")).collect();
         let mut stmt = conn
