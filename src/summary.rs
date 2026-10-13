@@ -853,6 +853,115 @@ static PHRASES: &[Phrase] = &[
         ("Registry", Slot::Value("registryId")),
         ("Record", Slot::Value("checksum")),
     ]),
+    // ---- Safe ----------------------------------------------------------
+    phrase(
+        "ProxyCreation(address,address)",
+        "multisig deployed",
+        "Deploy Multisig",
+        &[Slot::Account("proxy")],
+    ),
+    phrase(
+        "SafeSetup(address,address[],uint256,address,address)",
+        "multisig set up",
+        "Set Up Multisig",
+        &[Slot::Word("with threshold"), Slot::Value("threshold")],
+    ),
+    phrase(
+        "SafeMultiSigTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes,bytes)",
+        "multisig call",
+        "Multisig Call",
+        &[Slot::Word("to"), Slot::Account("to")],
+    ),
+    phrase(
+        "SafeModuleTransaction(address,address,uint256,bytes,uint8)",
+        "module call",
+        "Module Call",
+        &[Slot::Word("to"), Slot::Account("to")],
+    ),
+    phrase(
+        "ExecutionSuccess(bytes32,uint256)",
+        "multisig executed",
+        "Execute Multisig Transaction",
+        &[Slot::Hex("txHash")],
+    ),
+    phrase(
+        "ExecutionFailure(bytes32,uint256)",
+        "multisig reverted",
+        "Multisig Transaction Failed",
+        &[Slot::Hex("txHash")],
+    ),
+    phrase(
+        "ExecutionFromModuleSuccess(address)",
+        "module executed",
+        "Execute Module Transaction",
+        &[Slot::Word("from"), Slot::Account("module")],
+    ),
+    phrase(
+        "ExecutionFromModuleFailure(address)",
+        "module reverted",
+        "Module Transaction Failed",
+        &[Slot::Word("from"), Slot::Account("module")],
+    ),
+    phrase(
+        "ApproveHash(bytes32,address)",
+        "hash approved",
+        "Approve Hash",
+        &[Slot::Hex("approvedHash"), Slot::Word("by"), Slot::Account("owner")],
+    ),
+    phrase(
+        "SignMsg(bytes32)",
+        "message signed",
+        "Sign Message",
+        &[Slot::Hex("msgHash")],
+    ),
+    phrase(
+        "AddedOwner(address)",
+        "owner added",
+        "Add Owner",
+        &[Slot::Account("owner")],
+    ),
+    phrase(
+        "RemovedOwner(address)",
+        "owner removed",
+        "Remove Owner",
+        &[Slot::Account("owner")],
+    ),
+    phrase(
+        "ChangedThreshold(uint256)",
+        "threshold changed",
+        "Change Threshold",
+        &[Slot::Word("to"), Slot::Value("threshold")],
+    ),
+    phrase(
+        "EnabledModule(address)",
+        "module enabled",
+        "Enable Module",
+        &[Slot::Account("module")],
+    ),
+    phrase(
+        "DisabledModule(address)",
+        "module disabled",
+        "Disable Module",
+        &[Slot::Account("module")],
+    ),
+    phrase(
+        "ChangedFallbackHandler(address)",
+        "fallback handler changed",
+        "Change Fallback Handler",
+        &[Slot::Word("to"), Slot::Account("handler")],
+    ),
+    phrase(
+        "ChangedGuard(address)",
+        "guard changed",
+        "Change Guard",
+        &[Slot::Word("to"), Slot::Account("guard")],
+    ),
+    phrase(
+        "SafeReceived(address,uint256)",
+        "multisig funded",
+        "Receive",
+        &[Slot::Word("from"), Slot::Account("sender")],
+    ),
 ];
 
 // ---------------------------------------------------------------------------
@@ -904,11 +1013,16 @@ pub struct KnownEvent {
 }
 
 /// Whether an event is worth leading with. Bookkeeping the chain does beside
-/// the actual work — a nonce bump, a key check — is not.
+/// the actual work — a nonce bump, a key check, a multisig announcing its call — is not.
 fn is_preferred(event: &KnownEvent) -> bool {
     !matches!(
         event.kind.as_str(),
-        "key authorized" | "key revoked" | "nonce incremented" | "access key spend"
+        "key authorized"
+            | "key revoked"
+            | "nonce incremented"
+            | "access key spend"
+            | "multisig call"
+            | "module call"
     )
 }
 

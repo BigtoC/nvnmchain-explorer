@@ -5,6 +5,7 @@ use nvnmchain_explorer::decoder::{
 };
 use nvnmchain_explorer::models::{AnchoringEvent, BlockBundle, Transaction, TransferEvent};
 use nvnmchain_explorer::parse::{parse_block, parse_transaction};
+use nvnmchain_explorer::summary::{build_summary, known_events, Tokens};
 use nvnmchain_explorer::tokens::{
     decode_string_result, format_token_amount, has_control_chars, sanitize_metadata_text, TokenMeta,
 };
@@ -187,6 +188,30 @@ fn decode_the_anchoring_contract() {
     assert_eq!(event.name.as_deref(), Some("UpdateRecordStatus"));
     assert_eq!(event.params[0].value, checksum_address(&caller));
     assert_eq!(event.params[4].value, "Revoked");
+}
+
+/// Testnet transaction 0xb5f3b38398dfa524bba7d3da6e9bd3c131f77ffedf9655f9163c4cf2f974f2e8.
+#[test]
+fn a_multisig_transaction_leads_with_what_it_did() {
+    let logs: Vec<Value> =
+        serde_json::from_str(include_str!("../fixtures/safe_tx_logs.json")).expect("fixture");
+    let events: Vec<_> = logs.iter().filter_map(decode_event).collect();
+    let tokens = Tokens::new();
+    let known = known_events(&events, &tokens, None);
+    let said: Vec<_> = known.iter().map(|e| e.headline.as_str()).collect();
+    assert_eq!(
+        said,
+        [
+            "Multisig Call to 0x20C0…0000",
+            "Send 1000000 to 0xE3BE…e0d2",
+            "Execute Multisig Transaction 0xe420…b866",
+            "Pay Fee 201 to 0xfeEC…0000",
+        ]
+    );
+    assert_eq!(
+        build_summary(true, &known, None, &tokens).headline,
+        "Send 1000000 to 0xE3BE…e0d2."
+    );
 }
 
 #[test]

@@ -178,11 +178,11 @@ rather than silently failing to decode. The few declarations with no binding
 are Solidity signatures at the top of `src/decoder.rs`: a typo there does not
 parse, and tests pin the selectors they hash to.
 
-Multicall3, Permit2, CreateX and the anchoring contract at `0x…0a00` are not
-Tempo's, so no binding carries them. The first three are vendored JSON under
-`abi/`. Anchoring comes from the nvnmchain-contracts submodule at `contracts/`,
-which generates `layout/anchoring.abi.json` beside the bytecode Tempo's genesis
-uses, so the explorer cannot decode against an ABI the contract no longer has.
+Contracts that are not Tempo's have no binding. Their ABIs are vendored JSON
+under `abi/`, listed in `VENDORED` in `src/decoder.rs`. Anchoring's comes from
+the nvnmchain-contracts submodule at `contracts/`, which generates
+`layout/anchoring.abi.json` beside the bytecode Tempo's genesis uses, so the
+explorer cannot decode against an ABI the contract no longer has.
 
 The anchoring pages read that contract over RPC, not the index: the corpus it
 was seeded with at genesis emitted no events. So does the search box, for a whole
