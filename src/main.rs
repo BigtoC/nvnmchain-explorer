@@ -14,18 +14,28 @@ use nvnmchain_explorer::web;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Local development: pick up a `.env` from the working directory. Variables
+    // already set in the environment win, so deployments are unaffected.
+    let dotenv = dotenvy::dotenv();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "nvnmchain_explorer=info".into()),
         )
         .init();
+    match dotenv {
+        Ok(path) => info!("loaded environment from {}", path.display()),
+        Err(e) if e.not_found() => {}
+        Err(e) => warn!("could not fully load .env: {e}"),
+    }
 
     let cfg = Settings::from_env();
     info!(
         "starting nvnmchain Explorer (rpc={}, db={})",
         cfg.rpc_url, cfg.db_path
     );
+    // Informational only for now: indexer and web server both run in every role.
+    info!("role: {}", cfg.role);
 
     let conn = db::init_db(&cfg.db_path).context("initialize database")?;
     let db: Db = Arc::new(Mutex::new(conn));

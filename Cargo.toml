@@ -36,6 +36,7 @@ alloy-json-abi = "1"
 alloy-primitives = "1"
 alloy-sol-types = "1"
 alloy-consensus = "2"
+dotenvy = "0.15"
 
 [dev-dependencies]
 tempfile = "3"

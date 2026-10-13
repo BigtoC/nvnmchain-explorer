@@ -3,6 +3,7 @@
 //! Defaults target the chain we validate against; override with env vars.
 
 use std::env;
+use std::fmt;
 
 pub const DEFAULT_RPC_URL: &str = "https://rpc.nvnm.canary.mantrachain.dev";
 pub const DEFAULT_WS_URL: &str = "wss://ws.nvnm.canary.mantrachain.dev";
@@ -10,8 +11,46 @@ pub const DEFAULT_WS_URL: &str = "wss://ws.nvnm.canary.mantrachain.dev";
 pub const DEFAULT_CHAIN_ID: u64 = 787_222;
 pub const DEFAULT_PORT: u16 = 8080;
 
+/// Which parts of the explorer this process runs, read from `ROLE`.
+///
+/// Informational for now: every process still runs both the indexer and the
+/// web server, whatever its role says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Role {
+    /// Indexer and web server in one process, read/write database.
+    #[default]
+    All,
+    /// Indexing loops only, no server; read/write database.
+    Indexer,
+    /// Web server and live feed only; read-only database.
+    Web,
+}
+
+impl Role {
+    /// Parse a `ROLE` value, ignoring case and surrounding whitespace.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_uppercase().as_str() {
+            "ALL" => Some(Self::All),
+            "INDEXER" => Some(Self::Indexer),
+            "WEB" => Some(Self::Web),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::All => "ALL",
+            Self::Indexer => "INDEXER",
+            Self::Web => "WEB",
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
+    pub role: Role,
     pub rpc_url: String,
     pub ws_url: String,
     pub index_ws: bool,
@@ -85,6 +124,7 @@ impl Settings {
     pub fn from_env() -> Self {
         let port = env_u64("PORT", DEFAULT_PORT.into());
         Self {
+            role: role(),
             rpc_url: rpc_url(),
             ws_url: env_or("WS_URL", DEFAULT_WS_URL),
             index_ws: env::var("INDEX_WS")
@@ -110,6 +150,21 @@ impl Settings {
     }
 }
 
+/// Read `ROLE`; unset or empty means [`Role::All`].
+fn role() -> Role {
+    match env::var("ROLE") {
+        Ok(v) if v.trim().is_empty() => Role::default(),
+        Ok(v) => Role::parse(&v).unwrap_or_else(|| {
+            tracing::warn!(
+                "ROLE {v:?} is not one of ALL, INDEXER, WEB; using {}",
+                Role::default()
+            );
+            Role::default()
+        }),
+        Err(_) => Role::default(),
+    }
+}
+
 /// The signature directory to consult, or `None` when the operator has turned
 /// the lookup off with an empty `SIGNATURE_LOOKUP_URL`.
 fn signature_lookup_url() -> Option<String> {
@@ -123,5 +178,35 @@ fn signature_lookup_url() -> Option<String> {
 impl Default for Settings {
     fn default() -> Self {
         Self::from_env()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_role_parses_in_any_case() {
+        assert_eq!(Role::parse("ALL"), Some(Role::All));
+        assert_eq!(Role::parse("indexer"), Some(Role::Indexer));
+        assert_eq!(Role::parse(" Web\n"), Some(Role::Web));
+    }
+
+    #[test]
+    fn an_unknown_role_is_rejected() {
+        assert_eq!(Role::parse("both"), None);
+        assert_eq!(Role::parse(""), None);
+    }
+
+    #[test]
+    fn the_default_role_is_all() {
+        assert_eq!(Role::default(), Role::All);
+    }
+
+    #[test]
+    fn a_role_displays_as_its_env_value() {
+        for role in [Role::All, Role::Indexer, Role::Web] {
+            assert_eq!(Role::parse(&role.to_string()), Some(role));
+        }
     }
 }
