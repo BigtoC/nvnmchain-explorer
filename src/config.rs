@@ -32,7 +32,7 @@ pub struct Settings {
     /// Seconds between background recomputes of the home-page stats blob.
     pub stats_interval_seconds: f64,
     /// Signature directory consulted for selectors no built-in ABI declares.
-    /// Answers are cached in the database, misses included. `None` disables it
+    /// Answers are cached in memory, misses included. `None` disables it
     /// — the explorer then never talks to a third party.
     pub signature_lookup_url: Option<String>,
 }

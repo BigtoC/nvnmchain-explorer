@@ -303,6 +303,7 @@ async fn web_api_serves_indexed_data() {
         tera,
         block_events: block_tx,
         stats: std::sync::Arc::new(std::sync::RwLock::new(serde_json::Value::Null)),
+        signatures: Default::default(),
         shutdown: tokio::sync::watch::channel(false).1,
     };
     let app = web::app(state);

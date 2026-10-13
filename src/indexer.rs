@@ -9,14 +9,14 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use crate::config::Settings;
@@ -832,7 +832,7 @@ async fn wait_for_seed(db: &Db) -> u64 {
     }
 }
 
-async fn forward_loop(mut ix: Indexer, block_events: broadcast::Sender<Value>) {
+async fn forward_loop(mut ix: Indexer) {
     let (head_tx, mut head_rx) = mpsc::channel::<u64>(256);
     tokio::spawn(crate::ws::head_watcher(
         ix.rpc.clone(),
@@ -887,15 +887,6 @@ async fn forward_loop(mut ix: Indexer, block_events: broadcast::Sender<Value>) {
                 }
                 continue;
             };
-            // Live feed is tip-only and in number order: concurrent fetches
-            // complete out of order, and backfill must not reach viewers.
-            for b in &bundles {
-                let _ = block_events.send(crate::models::block_event_json(
-                    &b.block,
-                    &b.txs,
-                    crate::models::STREAM_TX_CAP,
-                ));
-            }
             if !ix.send_bundles(bundles).await {
                 return;
             }
@@ -972,29 +963,14 @@ async fn backfill_loop(mut ix: Indexer) {
 }
 
 /// Run the indexer: one serialized DB writer plus forward and backfill loops.
-/// Newly written blocks are broadcast on `block_events` for live viewers.
 pub async fn run_forever(
     rpc: ChainRpc,
     db: Db,
     cfg: IndexerConfig,
-    block_events: broadcast::Sender<Value>,
-    stats: Arc<RwLock<Value>>,
     shutdown: watch::Receiver<bool>,
 ) {
     let stats_interval = cfg.stats_interval;
-    let stats_db = db.clone();
-    let stats_events = block_events.clone();
-    let stats_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        stats_loop(
-            stats_db,
-            stats,
-            stats_events,
-            stats_interval,
-            stats_shutdown,
-        )
-        .await
-    });
+    tokio::spawn(stats_loop(db.clone(), stats_interval, shutdown.clone()));
 
     tokio::spawn(genesis_loop(
         rpc.clone(),
@@ -1082,7 +1058,7 @@ pub async fn run_forever(
         shutdown,
         tip_lag: Arc::new(AtomicU64::new(0)),
     };
-    let forward = tokio::spawn(forward_loop(ix.clone(), block_events));
+    let forward = tokio::spawn(forward_loop(ix.clone()));
     let backfill = tokio::spawn(backfill_loop(ix));
     drop(bundle_tx);
 
@@ -1127,26 +1103,13 @@ async fn add_genesis_balances(rpc: &ChainRpc, db: &Db) -> Result<()> {
 
 /// Recompute the home-page stats blob into the `kv` table every interval so
 /// the web layer never has to scan history at request time.
-async fn stats_loop(
-    db: Db,
-    cell: Arc<RwLock<Value>>,
-    events: broadcast::Sender<Value>,
-    interval: Duration,
-    mut shutdown: watch::Receiver<bool>,
-) {
+async fn stats_loop(db: Db, interval: Duration, mut shutdown: watch::Receiver<bool>) {
     loop {
         if *shutdown.borrow() {
             break;
         }
-        match compute_and_store_stats(&db) {
-            Ok(stats) => {
-                *cell.write().unwrap_or_else(|e| e.into_inner()) = stats.clone();
-                // Live viewers get the refresh too, tagged the way block
-                // payloads are. Droppable: anyone who misses one is corrected
-                // by the next tick.
-                let _ = events.send(json!({ "type": "stats", "stats": stats }));
-            }
-            Err(e) => warn!("stats recompute failed: {e:#}"),
+        if let Err(e) = compute_and_store_stats(&db) {
+            warn!("stats recompute failed: {e:#}");
         }
         if sleep_or_shutdown(&mut shutdown, interval).await {
             break;

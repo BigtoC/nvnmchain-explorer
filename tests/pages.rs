@@ -187,7 +187,16 @@ fn transfer_bundle() -> BlockBundle {
 }
 
 /// A server over the fixture, with `stats` as what the indexer would have left.
+/// The RPC is a closed local port, so a handler that falls back to it fails at
+/// once rather than reaching the live chain.
 async fn serve(stats: Value) -> (tempfile::TempDir, String) {
+    let (dir, base, _indexer) = serve_beside_indexer(stats, "http://127.0.0.1:1").await;
+    (dir, base)
+}
+
+/// The same over the node at `rpc_url`, with the connection an indexer writes
+/// through; the pages get a read-only one, so a page that writes fails.
+async fn serve_beside_indexer(stats: Value, rpc_url: &str) -> (tempfile::TempDir, String, Db) {
     use nvnmchain_explorer::web::{self, AppState};
 
     let (dir, db) = temp_db("pages.db");
@@ -217,30 +226,36 @@ async fn serve(stats: Value) -> (tempfile::TempDir, String) {
     db::save_block_bundle(&db, &transfer_bundle()).expect("transfers");
 
     let mut cfg = Settings::from_env();
-    // Nothing here may reach the network. The signature directory is exercised
-    // against a stub of its own; the RPC points at a closed local port, so any
-    // handler that falls back to it fails at once instead of calling the live
-    // chain — which would make these tests both slow and non-deterministic.
     cfg.signature_lookup_url = None;
-    cfg.rpc_url = "http://127.0.0.1:1".into();
-    let tera = web::build_tera(db.clone()).expect("templates");
+    cfg.rpc_url = rpc_url.into();
+    let pages = rusqlite::Connection::open_with_flags(
+        dir.path().join("pages.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("read-only connection");
+    let pages: Db = Arc::new(Mutex::new(pages));
+    let (running, shutdown) = tokio::sync::watch::channel(false);
     let state = AppState {
-        db,
+        tera: web::build_tera(pages.clone()).expect("templates"),
+        db: pages,
         rpc: nvnmchain_explorer::rpc::ChainRpc::from_settings(&cfg).expect("rpc"),
         cfg,
-        tera,
         block_events: tokio::sync::broadcast::channel(16).0,
         stats: Arc::new(std::sync::RwLock::new(stats)),
-        shutdown: tokio::sync::watch::channel(false).1,
+        signatures: Default::default(),
+        shutdown,
     };
+    tokio::spawn(web::feed(state.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
+        // A dropped sender ends the live stream.
+        let _running = running;
         let _ = axum::serve(listener, web::app(state)).await;
     });
-    (dir, format!("http://{addr}"))
+    (dir, format!("http://{addr}"), db)
 }
 
 async fn get_json(base: &str, path: &str) -> Value {
@@ -407,6 +422,137 @@ async fn a_token_page_for_an_unknown_address_stores_nothing() {
     let address = get_json(&base, &format!("/address/{junk}?")).await;
     assert_eq!(address["type"], json!("eoa"));
     assert!(address["token_meta"].is_null());
+}
+
+/// A node that traces any transaction, and how many times it was asked to.
+async fn stub_tracing_node() -> (String, Arc<AtomicUsize>) {
+    use axum::{routing::post, Json, Router};
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let handler = {
+        let hits = hits.clone();
+        move |Json(call): Json<Value>| {
+            let traced = call["method"] == "debug_traceTransaction";
+            if traced {
+                hits.fetch_add(1, Ordering::SeqCst);
+            }
+            let inner = json!({"type": "CALL", "from": TOKEN, "to": RECIPIENT, "input": "0x"});
+            let trace = json!({"type": "CALL", "from": SENDER, "to": TOKEN, "input": "0x", "calls": [inner]});
+            let result = if traced { trace } else { Value::Null };
+            async move { Json(json!({"jsonrpc": "2.0", "id": call["id"], "result": result})) }
+        }
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, Router::new().route("/", post(handler))).await;
+    });
+    (format!("http://{addr}"), hits)
+}
+
+/// A transaction stored without a trace is traced once, not on every view.
+#[tokio::test]
+async fn a_missing_trace_is_fetched_once() {
+    let (node, hits) = stub_tracing_node().await;
+    let (_dir, base, indexer) = serve_beside_indexer(Value::Null, &node).await;
+    let hash = format!("0x{}", "d1".repeat(32));
+    let mut untraced = transaction(&hash, 1, successful_receipt());
+    untraced.trace_data = None;
+    db::save_transaction(&indexer, &untraced).expect("tx");
+
+    for _ in 0..2 {
+        let page = get_json(&base, &format!("/tx/{hash}?")).await;
+        assert_eq!(page["calls"].as_array().map(Vec::len), Some(2), "{page}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+/// A node that answers a token's views, which arrive as one batch.
+async fn stub_token_node() -> String {
+    use axum::{routing::post, Json, Router};
+
+    fn string(s: &str) -> String {
+        format!("0x{:064x}{:064x}{:0<64}", 32, s.len(), hex::encode(s))
+    }
+    fn answer(call: &Value) -> Value {
+        let result = match call["params"][0]["data"].as_str() {
+            Some("0x06fdde03") => string("Stub Dollar"),
+            Some("0x95d89b41") => string("stubUSD"),
+            _ => format!("0x{:064x}", 6),
+        };
+        json!({"jsonrpc": "2.0", "id": call["id"], "result": result})
+    }
+    let handler = |Json(batch): Json<Vec<Value>>| async move {
+        Json(batch.iter().map(answer).collect::<Vec<_>>())
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, Router::new().route("/", post(handler))).await;
+    });
+    format!("http://{addr}")
+}
+
+/// A token the index has not met is shown from the node's answer, not stored.
+#[tokio::test]
+async fn a_token_the_index_has_not_met_is_shown_and_not_stored() {
+    let node = stub_token_node().await;
+    let (_dir, base, _indexer) = serve_beside_indexer(Value::Null, &node).await;
+    let before = get_json(&base, "/tokens?").await["total"].clone();
+    let unmet = "0x20C0000000000000000000000000000000000abc";
+
+    let page = get_json(&base, &format!("/token/{unmet}?")).await;
+    assert_eq!(page["token"]["name"], json!("Stub Dollar"));
+    assert_eq!(page["token"]["symbol"], json!("stubUSD"));
+    assert_eq!(page["token"]["decimals"], json!(6));
+
+    assert_eq!(get_json(&base, "/tokens?").await["total"], before);
+}
+
+/// What an indexer stores reaches a viewer and the home page through the
+/// database alone.
+#[tokio::test]
+async fn the_live_feed_follows_the_database() {
+    use futures_util::StreamExt;
+
+    let (_dir, base, indexer) = serve_beside_indexer(Value::Null, "http://127.0.0.1:1").await;
+    let feed = reqwest::get(format!("{base}/api/events"))
+        .await
+        .expect("GET /api/events");
+    let mut feed = feed.bytes_stream();
+
+    let mut next = block();
+    next.number = 102;
+    next.hash = format!("0x{}", "12".repeat(32));
+    next.tx_count = 0;
+    db::save_block(&indexer, &next).expect("block");
+    db::lock(&indexer)
+        .execute(
+            "INSERT INTO kv (key, value, updated_at) VALUES ('stats', '{\"total_blocks\":3}', 0)",
+            [],
+        )
+        .expect("stats");
+
+    let mut seen = String::new();
+    let carried = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !(seen.contains(r#""number":102"#) && seen.contains("event: stats")) {
+            let chunk = feed.next().await.expect("feed open").expect("chunk");
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    })
+    .await;
+    assert!(
+        carried.is_ok(),
+        "no new block and stats on the feed: {seen}"
+    );
+
+    let home = get_json(&base, "/?").await;
+    assert_eq!(home["stats"]["total_blocks"], json!(3));
+    assert_eq!(home["latest_num"], json!(102));
 }
 
 /// Pressing Enter in the search box resolves to one destination, and the
@@ -952,17 +1098,17 @@ async fn an_unknown_selector_is_named_by_the_directory() {
     }))
     .await;
 
-    let (_dir, db) = temp_db("signatures.db");
+    let cache = signatures::Cache::default();
     let mut cfg = Settings::from_env();
     cfg.signature_lookup_url = Some(url);
     let client = reqwest::Client::new();
 
-    let names = signatures::resolve(&db, &cfg, &client, std::slice::from_ref(&selector)).await;
+    let names = signatures::resolve(&cache, &cfg, &client, std::slice::from_ref(&selector)).await;
     assert_eq!(names.get(&selector).map(String::as_str), Some(signature));
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 
     // The answer is cached, so a second page view asks nobody.
-    let again = signatures::resolve(&db, &cfg, &client, std::slice::from_ref(&selector)).await;
+    let again = signatures::resolve(&cache, &cfg, &client, std::slice::from_ref(&selector)).await;
     assert_eq!(again, names);
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 
@@ -994,18 +1140,18 @@ async fn a_wrong_or_missing_answer_is_remembered_as_a_miss() {
     }))
     .await;
 
-    let (_dir, db) = temp_db("bad-signatures.db");
+    let cache = signatures::Cache::default();
     let mut cfg = Settings::from_env();
     cfg.signature_lookup_url = Some(url);
     let client = reqwest::Client::new();
 
     assert!(
-        signatures::resolve(&db, &cfg, &client, std::slice::from_ref(&selector))
+        signatures::resolve(&cache, &cfg, &client, std::slice::from_ref(&selector))
             .await
             .is_empty(),
         "a signature that does not hash to the selector must be refused"
     );
-    signatures::resolve(&db, &cfg, &client, std::slice::from_ref(&selector)).await;
+    signatures::resolve(&cache, &cfg, &client, std::slice::from_ref(&selector)).await;
     assert_eq!(
         hits.load(Ordering::SeqCst),
         1,
@@ -1016,11 +1162,10 @@ async fn a_wrong_or_missing_answer_is_remembered_as_a_miss() {
 /// With no directory configured, nothing is asked and nothing breaks.
 #[tokio::test]
 async fn the_directory_can_be_turned_off() {
-    let (_dir, db) = temp_db("no-directory.db");
     let mut cfg = Settings::from_env();
     cfg.signature_lookup_url = None;
     let names = signatures::resolve(
-        &db,
+        &signatures::Cache::default(),
         &cfg,
         &reqwest::Client::new(),
         &["0xdeadbeef".to_string()],

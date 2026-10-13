@@ -333,10 +333,7 @@ pub fn init_db(path: &str) -> Result<Connection> {
             PRIMARY KEY (token_addr, holder_addr)
         );
 
-        -- Function signatures for selectors no built-in ABI declares, as
-        -- answered by the configured directory. An empty `signature` is a
-        -- remembered miss: the directory did not know it either, and asking
-        -- again on every page view would be a request per view forever.
+        -- Unused: selector names are cached in memory now.
         CREATE TABLE IF NOT EXISTS selector_names (
             selector TEXT PRIMARY KEY,
             signature TEXT NOT NULL DEFAULT '',
@@ -603,6 +600,18 @@ pub fn set_chain_head(db: &Db, head: i64) {
     let _ = set_kv(&conn, "chain_head", &head.to_string());
 }
 
+/// Highest stored block height; `None` when the table is empty.
+pub fn get_max_block_number(db: &Db) -> Option<i64> {
+    query_opt(
+        &lock(db),
+        "get_max_block_number",
+        "SELECT MAX(number) FROM blocks",
+        [],
+        |r| r.get::<_, Option<i64>>(0),
+    )
+    .flatten()
+}
+
 /// Lowest stored block height; `None` when the table is empty.
 pub fn get_min_block_number(db: &Db) -> Option<i64> {
     query_opt(
@@ -696,16 +705,6 @@ fn upsert_transaction(conn: &Connection, tx: &Transaction) -> Result<()> {
             tx.timestamp,
             tx.created_at,
         ],
-    )?;
-    Ok(())
-}
-
-/// Cache a call trace onto its row. One column: rewriting the row would copy the
-/// raw bytes and the receipt beside it for nothing.
-pub fn set_trace(db: &Db, hash: &str, trace: &str) -> Result<()> {
-    lock(db).execute(
-        "UPDATE transactions SET trace_data=?1 WHERE hash=?2",
-        params![trace, hex_blob(hash)],
     )?;
     Ok(())
 }
@@ -1515,62 +1514,6 @@ pub fn get_token_holders(
         params![token_addr, per_page as i64, page_offset(page, per_page)],
         |r| Ok((addr_from_value(r.get_ref(0)?), r.get(1)?)),
     )
-}
-
-// ---------------------------------------------------------------------------
-// Selector name cache
-// ---------------------------------------------------------------------------
-
-/// Cached signatures by selector. A remembered miss comes back as an empty
-/// string, which is what tells the caller not to ask again.
-pub fn get_selector_names(
-    db: &Db,
-    selectors: &[String],
-    fresh_after: i64,
-) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    if selectors.is_empty() {
-        return out;
-    }
-    let conn = lock(db);
-    for chunk in selectors.chunks(100) {
-        let placeholders = vec!["?"; chunk.len()].join(",");
-        let sql = format!(
-            "SELECT selector, signature FROM selector_names
-             WHERE selector IN ({placeholders}) AND fetched_at >= ?"
-        );
-        let params = rusqlite::params_from_iter(
-            chunk
-                .iter()
-                .map(|s| rusqlite::types::Value::Text(s.to_lowercase()))
-                .chain(std::iter::once(rusqlite::types::Value::Integer(
-                    fresh_after,
-                ))),
-        );
-        for (selector, signature) in query_rows(&conn, "get_selector_names", &sql, params, |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        }) {
-            out.insert(selector, signature);
-        }
-    }
-    out
-}
-
-/// Remember what a directory said about each selector, misses included.
-pub fn save_selector_names(db: &Db, answers: &[(String, String)]) -> Result<()> {
-    let mut conn = lock(db);
-    let txn = conn.transaction()?;
-    for (selector, signature) in answers {
-        exec_cached(
-            &txn,
-            "INSERT INTO selector_names (selector, signature, fetched_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(selector) DO UPDATE SET
-                 signature=excluded.signature, fetched_at=excluded.fetched_at",
-            params![selector.to_lowercase(), signature, now_ts()],
-        )?;
-    }
-    txn.commit()?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

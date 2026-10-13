@@ -233,6 +233,7 @@ async fn serve(rpc_url: String) -> (tempfile::TempDir, String) {
         cfg,
         block_events: tokio::sync::broadcast::channel(16).0,
         stats: Arc::new(std::sync::RwLock::new(Value::Null)),
+        signatures: Default::default(),
         shutdown: tokio::sync::watch::channel(false).1,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -113,8 +113,9 @@ The indexer is built for a sub-second chain:
   most networks), the indexer warns a few times, then retries silently on a
   long backoff while polling continues uninterrupted.
 - **One RPC call per block** — receipts via `eth_getBlockReceipts` (with a
-  per-transaction batch fallback), traces via `debug_traceBlockByNumber`, and
-  blocks fetched concurrently (`INDEX_CONCURRENCY` in flight).
+  per-transaction batch fallback), and blocks fetched concurrently
+  (`INDEX_CONCURRENCY` in flight). Call traces are not indexed: a transaction's
+  page asks the node for its trace once and keeps it in memory.
 - **Serialized SQLite writes** — every block (block row + txs + transfers +
   balances + token metadata) is persisted in one transaction by a single
   writer task, measured at ~200 blocks/s while backfilling.
@@ -164,9 +165,8 @@ All data endpoints accept `?format=json` or `Accept: application/json`.
 
 The home page subscribes to `/api/events` with `EventSource` and updates the
 latest-blocks panel, the latest-block stat, and the block-time stat in real
-time as blocks land — no client polling. The feed is in-process: run a single
-instance (as the deploy configs do) so the indexer and the web server share
-the same broadcast channel.
+time as blocks land — no client polling. The feed is polled from the
+database, so the web server need not share a process with the indexer.
 
 ### Decoding
 

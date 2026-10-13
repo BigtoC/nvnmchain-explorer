@@ -1,8 +1,9 @@
-//! Axum web application: routes, JSON API, and Tera-rendered HTML.
+//! Axum web application: routes, JSON API, and Tera-rendered HTML. It only
+//! reads the database, which is all it shares with the indexer.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -49,11 +50,12 @@ pub struct AppState {
     pub rpc: ChainRpc,
     pub cfg: Settings,
     pub tera: Arc<Tera>,
-    /// Live stream of indexed blocks, fed by the indexer writer task.
+    /// Live stream of indexed blocks, published by [`feed`].
     pub block_events: broadcast::Sender<Value>,
-    /// Home-page stats, published by the indexer's stats task — read here so
-    /// a page view costs no aggregate queries.
+    /// Home-page stats, kept current by [`feed`] so a page view costs no
+    /// aggregate queries.
     pub stats: Arc<RwLock<Value>>,
+    pub signatures: Arc<signatures::Cache>,
     /// Flipped on SIGINT/SIGTERM. The SSE stream ends when it flips; since
     /// this state owns a `block_events` sender, it never ends on its own.
     pub shutdown: watch::Receiver<bool>,
@@ -436,7 +438,13 @@ async fn name_unknown_calls(state: &AppState, calls: &mut [Value]) {
         return;
     }
 
-    let names = signatures::resolve(&state.db, &state.cfg, state.rpc.http_client(), &unnamed).await;
+    let names = signatures::resolve(
+        &state.signatures,
+        &state.cfg,
+        state.rpc.http_client(),
+        &unnamed,
+    )
+    .await;
     if names.is_empty() {
         return;
     }
@@ -750,11 +758,58 @@ pub async fn home(
     html_or_json(&state, &headers, &query, "home.html", &ctx)
 }
 
-/// Server-Sent Events endpoint: pushes each newly indexed block to browsers
-/// so the home page updates live without polling. Sends the current tip
-/// immediately on connect, then every block as the indexer writes it (the
-/// writer emits in number order, so the stream is gapless; if this subscriber
-/// ever falls behind the broadcast, missed blocks are replayed from the DB).
+/// How often [`feed`] polls the database.
+const FEED_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The live-feed events for the blocks indexed in `start..=end`, oldest first.
+fn block_events_in_range(db: &Db, start: i64, end: i64) -> Vec<Value> {
+    // Two range queries for the whole span, not two per height.
+    let blocks = db::get_blocks_in_range(db, start, end);
+    let txs = db::get_transactions_in_range(db, start, end, TxColumns::List);
+    blocks
+        .into_iter()
+        .rev()
+        .map(|block| {
+            let first = txs.partition_point(|t| t.block_number < block.number);
+            let past = txs.partition_point(|t| t.block_number <= block.number);
+            crate::models::block_event_json(&block, &txs[first..past], crate::models::STREAM_TX_CAP)
+        })
+        .collect()
+}
+
+/// Publish each new tip block and stats refresh the indexer stored. Backfill
+/// lands below the tip, so it never reaches viewers.
+pub async fn feed(state: AppState) {
+    let tip = || db::get_max_block_number(&state.db).unwrap_or(-1);
+    let (mut sent, mut stats) = (tip(), String::new());
+    while !*state.shutdown.borrow() {
+        let head = tip();
+        if head > sent {
+            for event in block_events_in_range(&state.db, sent + 1, head) {
+                // No viewer connected is not an error.
+                let _ = state.block_events.send(event);
+            }
+            sent = head;
+        }
+        if let Some(stored) = db::get_kv(&state.db, "stats").filter(|s| *s != stats) {
+            match serde_json::from_str::<Value>(&stored) {
+                Ok(value) => {
+                    *state.stats.write().unwrap_or_else(|e| e.into_inner()) = value.clone();
+                    let _ = state
+                        .block_events
+                        .send(json!({ "type": "stats", "stats": value }));
+                }
+                Err(e) => tracing::warn!("stored stats are not JSON: {e}"),
+            }
+            stats = stored;
+        }
+        tokio::time::sleep(FEED_INTERVAL).await;
+    }
+}
+
+/// Server-Sent Events endpoint: the current tip on connect, then every block
+/// [`feed`] publishes. A subscriber that falls behind the broadcast is
+/// replayed the blocks it missed from the DB.
 pub async fn events(State(state): State<AppState>) -> Response {
     let rx = state.block_events.subscribe();
     let stream = unfold(
@@ -814,11 +869,11 @@ async fn sse_step(
     // are populated immediately on connect.
     if !state.sent_initial {
         state.sent_initial = true;
-        if let Some(b) = db::get_latest_block(&state.db) {
-            state.last_num = b.number;
-            let txs = db::get_block_transactions(&state.db, b.number, TxColumns::List);
-            let payload = crate::models::block_event_json(&b, &txs, crate::models::STREAM_TX_CAP);
-            return Some((sse_event(&payload), state));
+        if let Some(tip) = db::get_max_block_number(&state.db) {
+            state.last_num = tip;
+            if let Some(payload) = block_events_in_range(&state.db, tip, tip).pop() {
+                return Some((sse_event(&payload), state));
+            }
         }
         return Some((Ok(Event::default().event("block").data("null")), state));
     }
@@ -847,30 +902,17 @@ async fn sse_step(
             }
             Err(broadcast::error::RecvError::Lagged(_)) => {
                 // This client fell behind (browser throttled / connection
-                // stalled). The writer emits in number order, so the missed
+                // stalled). The feed sends in number order, so the missed
                 // blocks are exactly `last_num + 1 ..= tip`; replay them from
                 // the DB instead of skipping them. The dropped-message count is
                 // no use as a bound -- stats refreshes share this channel and
                 // are counted too -- so the tip bounds the window.
-                let tip = db::get_latest_block(&state.db)
-                    .map(|b| b.number)
-                    .unwrap_or(state.last_num);
+                let tip = db::get_max_block_number(&state.db).unwrap_or(state.last_num);
                 let start = state.last_num + 1;
                 let end = tip.min(start + SSE_MAX_REPLAY as i64 - 1);
-                // Two range queries for the whole span, not two per height: a
-                // client that fell far behind replays up to `SSE_MAX_REPLAY`.
-                let blocks = db::get_blocks_in_range(&state.db, start, end);
-                let txs = db::get_transactions_in_range(&state.db, start, end, TxColumns::List);
-                // Oldest first, since the writer emits in number order.
-                for block in blocks.into_iter().rev() {
-                    let first = txs.partition_point(|t| t.block_number < block.number);
-                    let past = txs.partition_point(|t| t.block_number <= block.number);
-                    state.pending.push_back(crate::models::block_event_json(
-                        &block,
-                        &txs[first..past],
-                        crate::models::STREAM_TX_CAP,
-                    ));
-                }
+                state
+                    .pending
+                    .extend(block_events_in_range(&state.db, start, end));
                 state.last_num = state.last_num.max(end);
                 if let Some(v) = state.pending.pop_front() {
                     return Some((sse_event(&v), state));
@@ -1054,14 +1096,25 @@ fn is_method_unsupported(err: &anyhow::Error) -> bool {
         || message.contains("not available")
 }
 
-/// The call trace for a transaction indexed without one. Cached back onto the
-/// row, so only the first view of a transaction pays for it.
+/// Traces already fetched, by transaction hash: nothing stores them, so this
+/// is what keeps every view from tracing the transaction again.
+static TRACES: LazyLock<Mutex<HashMap<String, Vec<Value>>>> = LazyLock::new(Default::default);
+
+/// Traces held before the cache starts over.
+const MAX_TRACES: usize = 256;
+
+/// The call trace for a transaction stored without one, asked of the node once.
 async fn fetch_missing_trace(
     state: &AppState,
     tx: &crate::models::Transaction,
 ) -> Option<Vec<Value>> {
-    if TRACING_UNAVAILABLE.load(Ordering::Relaxed) {
-        return None;
+    let cached = TRACES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&tx.hash)
+        .cloned();
+    if cached.is_some() || TRACING_UNAVAILABLE.load(Ordering::Relaxed) {
+        return cached;
     }
     let fetched = tokio::time::timeout(
         TRACE_FETCH_TIMEOUT,
@@ -1087,11 +1140,11 @@ async fn fetch_missing_trace(
     if flat.is_empty() {
         return None;
     }
-    if let Ok(trace) = serde_json::to_string(&flat) {
-        if let Err(e) = db::set_trace(&state.db, &tx.hash, &trace) {
-            tracing::warn!("caching trace for {} failed: {e:#}", tx.hash);
-        }
+    let mut held = TRACES.lock().unwrap_or_else(|e| e.into_inner());
+    if held.len() >= MAX_TRACES {
+        held.clear();
     }
+    held.insert(tx.hash.clone(), flat.clone());
     Some(flat)
 }
 
@@ -1564,22 +1617,19 @@ pub async fn token_page(
             if fetched.name.is_empty() && fetched.symbol.is_empty() {
                 return not_found(&state, &headers, &query, "Token", &address);
             }
-            let _ = db::save_token_metadata(&state.db, &fetched);
-            db::get_token_metadata(&state.db, &checksummed).unwrap_or_else(|| {
-                // Fall back to a minimal descriptor if the save failed.
-                crate::models::TokenMetadata {
-                    address: checksummed.clone(),
-                    name: fetched.name,
-                    symbol: fetched.symbol,
-                    decimals: fetched.decimals,
-                    currency: fetched.currency,
-                    total_supply: fetched.total_supply,
-                    logo_uri: String::new(),
-                    holder_count: 0,
-                    created_at: db::now_ts(),
-                    updated_at: db::now_ts(),
-                }
-            })
+            // Shown, not stored: the indexer adds the row when the token moves.
+            crate::models::TokenMetadata {
+                address: checksummed.clone(),
+                name: fetched.name,
+                symbol: fetched.symbol,
+                decimals: fetched.decimals,
+                currency: fetched.currency,
+                total_supply: fetched.total_supply,
+                logo_uri: String::new(),
+                holder_count: 0,
+                created_at: db::now_ts(),
+                updated_at: db::now_ts(),
+            }
         }
     };
 
