@@ -4,8 +4,7 @@
 //! There are two fixture files. `record_baseline` writes both from the live chain:
 //!
 //! - `fixtures/baseline/canary-rpc.json`: the recorded answers. It has every
-//!   JSON-RPC answer the explorer got for the blocks in `RANGES`, and every
-//!   answer from the signature directory.
+//!   JSON-RPC answer the explorer got for the blocks in `RANGES`.
 //! - `fixtures/baseline/canary.db`: the baseline database. It is what the
 //!   explorer wrote from those answers.
 //!
@@ -16,8 +15,7 @@
 //! 1. It starts a fake node on a local port. The fake node answers from the recorded answers。
 //!    If the explorer asks for something that was not recorded, the test fails and names the request.
 //! 2. It runs the explorer's writes into a new, empty database (see `index`).
-//!    It saves the blocks in `RANGES`, runs the genesis balance pass, and looks
-//!    up function names like a page does.
+//!    It saves the blocks in `RANGES` and runs the genesis balance pass.
 //! 3. It checks that every table in the baseline has rows, and every column has at least one value
 //!    that is not NULL. If not, the test fails, because an empty table or column checks nothing.
 //!    The only exceptions are listed in `UNEXERCISED`, each with a reason.
@@ -43,12 +41,11 @@
 //! | `genesis_balances` |   29 | genesis balance pass: each holder's balance at block 0 |
 //! | `counters`         |    2 | saving blocks: block and transaction counts      |
 //! | `kv`               |    1 | genesis balance pass: `genesis_balances_cursor`  |
-//! | `selector_names`   |    7 | function name lookup: 1 name found, 6 not found  |
 //! | `sqlite_sequence`  |    1 | SQLite, for the `transfer_events` ids            |
 //!
 //! Not covered:
 //!
-//! - `transactions.trace_data`: see `UNEXERCISED`.
+//! - `transactions.trace_data` and `selector_names`: see `UNEXERCISED`.
 //! - The `kv` keys the live loops write (`stats`, `chain_head`,
 //!   `anchoring_backfilled_to`). Their values depend on the clock or on the
 //!   chain's current head, so they change on every run.
@@ -68,22 +65,21 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
 
-use axum::extract::{RawQuery, State};
+use axum::extract::State;
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::post;
 use axum::{Json, Router};
 use futures_util::{stream, StreamExt, TryStreamExt};
-use nvnmchain_explorer::config::{Settings, DEFAULT_RPC_URL, DEFAULT_SIGNATURE_LOOKUP_URL};
+use nvnmchain_explorer::config::DEFAULT_RPC_URL;
 use nvnmchain_explorer::db::{self, Db};
 use nvnmchain_explorer::indexer::fetch_block_bundle;
 use nvnmchain_explorer::rpc::ChainRpc;
-use nvnmchain_explorer::signatures;
 use nvnmchain_explorer::tokens::balances_at_genesis;
 use rusqlite::types::Value as Sql;
 use rusqlite::{Connection, OpenFlags};
@@ -113,13 +109,19 @@ const COMMIT: usize = 64;
 const EXCLUDED_COLUMNS: &[&str] = &["created_at", "updated_at", "fetched_at"];
 
 /// What the baseline leaves empty, and why: writes no recorded answer drives.
-const UNEXERCISED: &[(&str, &str)] = &[(
-    "transactions.trace_data",
-    "a page view caches it from debug_traceTransaction, which canary did not serve for these transactions",
-)];
+const UNEXERCISED: &[(&str, &str)] = &[
+    (
+        "transactions.trace_data",
+        "a page keeps the trace it fetches in memory",
+    ),
+    (
+        "selector_names",
+        "a page keeps the names it looks up in memory",
+    ),
+];
 
-/// Selectors per signature lookup, as a page asks them.
-const LOOKUP: usize = 32;
+/// JSON-RPC's code for a reverted call: the chain's answer, not a node failure.
+const REVERT: i64 = 3;
 
 /// The most differences printed; the count is always complete.
 const SHOWN: usize = 25;
@@ -153,8 +155,6 @@ struct Node {
     tape: Arc<Mutex<Tape>>,
     /// Recording: where calls missing from the tape are forwarded.
     upstream: Option<String>,
-    /// Recording: the signature directory lookups are forwarded to.
-    directory: Option<String>,
     /// Replaying: calls missing from the tape.
     missed: Arc<Mutex<BTreeSet<String>>>,
     client: reqwest::Client,
@@ -169,17 +169,25 @@ impl Node {
             let sent = self.client.post(url).json(&calls).send().await;
             if let Ok(resp) = sent.and_then(|r| r.error_for_status()) {
                 if let Ok(Value::Array(items)) = resp.json::<Value>().await {
-                    let mut tape = self.tape.lock().unwrap();
-                    for (i, call) in calls.iter().enumerate() {
-                        let item = items.iter().find(|r| r["id"] == json!(i));
-                        let Some(item) = item else { continue };
-                        let answer = match item.get("error").filter(|e| !e.is_null()) {
-                            Some(error) => json!({ "error": error }),
-                            None => json!({ "result": item["result"] }),
-                        };
-                        tape.entry(call_key(call)).or_insert(answer);
+                    // All or nothing: a missing answer, or an error that is
+                    // not a revert, is asked again.
+                    let answers: Option<Vec<Value>> = (0..calls.len())
+                        .map(|i| {
+                            let item = items.iter().find(|r| r["id"] == json!(i))?;
+                            match item.get("error").filter(|e| !e.is_null()) {
+                                None => Some(json!({ "result": item["result"] })),
+                                Some(e) if e["code"] == REVERT => Some(json!({ "error": e })),
+                                Some(_) => None,
+                            }
+                        })
+                        .collect();
+                    if let Some(answers) = answers {
+                        let mut tape = self.tape.lock().unwrap();
+                        for (call, answer) in calls.iter().zip(answers) {
+                            tape.entry(call_key(call)).or_insert(answer);
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
                 }
             }
             tokio::time::sleep(wait).await;
@@ -187,36 +195,6 @@ impl Node {
         }
         Err(StatusCode::BAD_GATEWAY)
     }
-}
-
-/// The signature directory: one GET, its answer keyed by query.
-async fn lookup(
-    State(node): State<Node>,
-    RawQuery(query): RawQuery,
-) -> Result<Json<Value>, StatusCode> {
-    let query = query.unwrap_or_default();
-    let key = format!("GET /signatures?{query}");
-    let recorded = node.tape.lock().unwrap().get(&key).cloned();
-    if let Some(body) = recorded {
-        return Ok(Json(body));
-    }
-    let Some(url) = &node.directory else {
-        node.missed.lock().unwrap().insert(key);
-        return Err(StatusCode::NOT_FOUND);
-    };
-    let mut wait = Duration::from_millis(250);
-    for _ in 0..6 {
-        let sent = node.client.get(format!("{url}?{query}")).send().await;
-        if let Ok(resp) = sent.and_then(|r| r.error_for_status()) {
-            if let Ok(body) = resp.json::<Value>().await {
-                let mut tape = node.tape.lock().unwrap();
-                return Ok(Json(tape.entry(key).or_insert(body).clone()));
-            }
-        }
-        tokio::time::sleep(wait).await;
-        wait *= 2;
-    }
-    Err(StatusCode::BAD_GATEWAY)
 }
 
 async fn answer(
@@ -261,21 +239,19 @@ async fn answer(
     }))
 }
 
-/// A node and signature directory on a local port answering from `tape`, and
-/// forwarding what it lacks upstream when recording. The chain is only asked
-/// for a tape started empty, so one tape never mixes answers from two chains.
+/// A node on a local port answering from `tape`, and forwarding what it lacks
+/// upstream when recording. The chain is only asked for a tape started empty,
+/// so one tape never mixes answers from two chains.
 async fn serve(tape: Tape, recording: bool) -> (Node, String) {
     let upstream = std::env::var("NVNM_RPC").unwrap_or_else(|_| DEFAULT_RPC_URL.to_string());
     let node = Node {
         upstream: (recording && tape.is_empty()).then_some(upstream),
         tape: Arc::new(Mutex::new(tape)),
-        directory: recording.then(|| DEFAULT_SIGNATURE_LOOKUP_URL.to_string()),
         missed: Arc::default(),
         client: reqwest::Client::new(),
     };
     let app = Router::new()
         .route("/", post(answer))
-        .route("/signatures", get(lookup))
         .with_state(node.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -286,8 +262,7 @@ async fn serve(tape: Tape, recording: bool) -> (Node, String) {
 /// Write into `db` what the explorer writes for `RANGES`, from the node at
 /// `url`: the blocks, fetched concurrently and written in ascending order; the
 /// genesis pass, which fills `genesis_balances` and adds each holder's block-0
-/// balance to `token_balances`; and the names a page looks up for the
-/// selectors in those transactions' top-level calldata.
+/// balance to `token_balances`.
 async fn index(url: &str, db: &Db) -> anyhow::Result<()> {
     let rpc = ChainRpc::new(url)?;
     let numbers: Vec<u64> = RANGES.iter().cloned().flatten().collect();
@@ -309,21 +284,6 @@ async fn index(url: &str, db: &Db) -> anyhow::Result<()> {
         let balances = balances_at_genesis(&rpc, &holders).await?;
         let rows: Vec<_> = holders.into_iter().zip(balances).collect();
         db::save_genesis_balances(db, &rows, cursor)?;
-    }
-
-    let selectors: Vec<String> = db::lock(db)
-        .prepare(
-            "SELECT DISTINCT lower(substr(input, 1, 10)) FROM transactions
-             WHERE length(input) >= 10 ORDER BY 1",
-        )?
-        .query_map([], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    let settings = Settings {
-        signature_lookup_url: Some(format!("{url}/signatures")),
-        ..Settings::from_env()
-    };
-    for chunk in selectors.chunks(LOOKUP) {
-        signatures::resolve(db, &settings, rpc.http_client(), chunk).await;
     }
     Ok(())
 }
@@ -445,13 +405,13 @@ fn compare(baseline: &Connection, fresh: &Connection) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn replay_reproduces_baseline() {
-    check_replay().await;
+    let tape = std::fs::read(fixture("canary-rpc.json")).unwrap();
+    let tape = serde_json::from_slice(&tape).expect("recorded answers");
+    check_replay(tape, &fixture("canary.db")).await;
 }
 
-/// Replay the tape into a fresh database and hold it to the baseline.
-async fn check_replay() {
-    let tape: Tape = serde_json::from_slice(&std::fs::read(fixture("canary-rpc.json")).unwrap())
-        .expect("recorded answers");
+/// Replay `tape` into a fresh database and hold it to `baseline`.
+async fn check_replay(tape: Tape, baseline: &Path) {
     let (node, url) = serve(tape, false).await;
 
     let dir = tempfile::tempdir().unwrap();
@@ -466,7 +426,7 @@ async fn check_replay() {
 
     // Read-only and immutable: nothing here can migrate or repair the baseline.
     let baseline = Connection::open_with_flags(
-        format!("file:{}?immutable=1", fixture("canary.db").display()),
+        format!("file:{}?immutable=1", baseline.display()),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
     .expect("open baseline");
@@ -500,10 +460,11 @@ async fn record_baseline() {
     eprintln!("recording {RANGES:?} onto {} answer(s)", tape.len());
     let (node, url) = serve(tape, true).await;
 
-    // The database is derived from the tape: always written afresh.
-    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-    let _ = std::fs::remove_file(&db_path);
-    let indexed = index(&url, &open_db(db_path.to_str().unwrap())).await;
+    // The database is derived from the tape: always written afresh, and
+    // elsewhere first, so a recording that fails leaves the fixtures alone.
+    let dir = tempfile::tempdir().unwrap();
+    let recorded = dir.path().join("canary.db");
+    let indexed = index(&url, &open_db(recorded.to_str().unwrap())).await;
     let missed = node.missed.lock().unwrap().clone();
     assert!(
         missed.is_empty(),
@@ -511,7 +472,7 @@ async fn record_baseline() {
     );
     indexed.expect("index the recorded answers");
     // Self-contained: no WAL beside it, and no free pages.
-    let conn = Connection::open(&db_path).unwrap();
+    let conn = Connection::open(&recorded).unwrap();
     conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
     conn.execute_batch("VACUUM").unwrap();
     for (table, (_, rows)) in dump(&conn) {
@@ -519,17 +480,18 @@ async fn record_baseline() {
     }
     eprintln!("  unexercised: {:?}", unexercised(&conn));
 
-    // One answer per line, so a new recording diffs readably.
-    {
-        let tape = node.tape.lock().unwrap();
-        let lines: Vec<String> = tape
-            .iter()
-            .map(|(key, answer)| format!("{}: {answer}", json!(key)))
-            .collect();
-        std::fs::write(&tape_path, format!("{{\n{}\n}}\n", lines.join(",\n"))).unwrap();
-        eprintln!("  {} answer(s) recorded", tape.len());
-    }
     // An answer that came too late for its caller is on the tape but not in
     // the database: the two must agree before they are kept.
-    check_replay().await;
+    let tape = node.tape.lock().unwrap().clone();
+    check_replay(tape.clone(), &recorded).await;
+
+    // One answer per line, so a new recording diffs readably.
+    let lines: Vec<String> = tape
+        .iter()
+        .map(|(key, answer)| format!("{}: {answer}", json!(key)))
+        .collect();
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    std::fs::write(&tape_path, format!("{{\n{}\n}}\n", lines.join(",\n"))).unwrap();
+    std::fs::copy(&recorded, &db_path).unwrap();
+    eprintln!("  {} answer(s) recorded", lines.len());
 }
