@@ -103,6 +103,9 @@ fn tempo_contracts() -> Vec<(&'static str, JsonAbi)> {
             "current_committee",
             current_committee::ICurrentCommittee::abi::contract(),
         ),
+        ("zone_factory", zone_factory::IZoneFactory::abi::contract()),
+        // Only the events a portal logs while `createZone` sets it up.
+        ("zone_portal", zone_factory::IZonePortal::abi::contract()),
     ]
 }
 

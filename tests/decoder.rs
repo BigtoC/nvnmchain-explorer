@@ -190,6 +190,22 @@ fn decode_the_anchoring_contract() {
     assert_eq!(event.params[4].value, "Revoked");
 }
 
+#[test]
+fn decode_the_zone_contracts() {
+    let call = decode_function_call("0x89677d9e").expect("decoded");
+    assert_eq!(call.name.as_deref(), Some("createZone"));
+
+    let log = json!({
+        "address": "0x5ad0000000000000000000000000000000000003",
+        "topics": ["0x3e5479494e0a078954a7ff8437aeca3bf7519b51a2fc06b3821251147ff9c5f7"],
+        "data": format!("0x{:064x}{:064x}", 0, 1),
+        "logIndex": "0x0",
+    });
+    let event = decode_event(&log).expect("decoded event");
+    assert_eq!(event.name.as_deref(), Some("EnforcementModesUpdated"));
+    assert_eq!(event.params[1].value, "true");
+}
+
 /// Testnet transaction 0xb5f3b38398dfa524bba7d3da6e9bd3c131f77ffedf9655f9163c4cf2f974f2e8.
 #[test]
 fn a_multisig_transaction_leads_with_what_it_did() {

@@ -1,8 +1,10 @@
 //! Contract identification and labels, mirroring `app/contracts.py`.
 
+use alloy_primitives::Address;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use tempo_primitives::TempoAddressExt as _;
 
 use crate::decoder::checksum_address;
 
@@ -63,6 +65,7 @@ fn precompile_labels() -> &'static HashMap<String, String> {
                 "0xC077e00000000000000000000000000000000000",
                 "Current Committee",
             ),
+            ("0x5AF2000000000000000000000000000000000000", "Zone Factory"),
         ];
         pairs
             .iter()
@@ -71,9 +74,8 @@ fn precompile_labels() -> &'static HashMap<String, String> {
     })
 }
 
-/// Ordinary contracts at fixed addresses: canonical deployments, and the two this chain places
-/// in genesis, the anchoring contract and its module admin. Kept apart from the precompiles,
-/// which they are not.
+/// Ordinary contracts at fixed addresses: canonical deployments, the anchoring contract and the
+/// zone portal implementation. Kept apart from the precompiles, which they are not.
 fn deployed_contracts() -> &'static HashMap<String, String> {
     static MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
     MAP.get_or_init(|| {
@@ -82,6 +84,10 @@ fn deployed_contracts() -> &'static HashMap<String, String> {
             ("0x000000000022D473030F116dDEE9F6B43aC78BA3", "Permit2"),
             ("0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed", "CreateX"),
             ("0x0000000000000000000000000000000000000a00", "Anchoring"),
+            (
+                "0x5AD1000000000000000000000000000000000000",
+                "Zone Portal Implementation",
+            ),
         ]
         .iter()
         .map(|(a, label)| (checksum_address(a), label.to_string()))
@@ -116,16 +122,12 @@ pub fn is_tip20_token(addr: &str) -> bool {
 pub fn is_contract(addr: &str) -> bool {
     let checksummed = checksum_address(addr);
     precompile_labels().contains_key(&checksummed)
-        || deployed_contracts().contains_key(&checksummed)
+        || deployed_contract_name(addr).is_some()
         || is_tip20_token(addr)
 }
 
 pub fn get_contract_name(addr: &str) -> Option<String> {
-    let checksummed = checksum_address(addr);
-    precompile_labels()
-        .get(&checksummed)
-        .or_else(|| deployed_contracts().get(&checksummed))
-        .cloned()
+    get_precompile_name(addr).or_else(|| deployed_contract_name(addr))
 }
 
 pub fn is_eoa(addr: &str) -> bool {
@@ -150,10 +152,10 @@ pub fn identify_address(addr: &str) -> AddressInfo {
             symbol: None,
         };
     }
-    if let Some(label) = deployed_contracts().get(&checksummed) {
+    if let Some(label) = deployed_contract_name(addr) {
         return AddressInfo {
             kind: "contract".into(),
-            label: Some(label.clone()),
+            label: Some(label),
             symbol: None,
         };
     }
@@ -171,9 +173,14 @@ pub fn identify_address(addr: &str) -> AddressInfo {
     }
 }
 
-/// The name of a contract at a fixed address (Multicall3, Permit2, CreateX, Anchoring).
+/// The name of a contract at a fixed address, or of the zone portal an address numbers.
 pub fn deployed_contract_name(addr: &str) -> Option<String> {
-    deployed_contracts().get(&checksum_address(addr)).cloned()
+    let checksummed = checksum_address(addr);
+    if let Some(name) = deployed_contracts().get(&checksummed) {
+        return Some(name.clone());
+    }
+    let id = checksummed.parse::<Address>().ok()?.zone_portal_id()?;
+    Some(format!("Zone Portal #{id}"))
 }
 
 /// Which built-in ABIs describe the contract at `addr`, by the names the
@@ -237,12 +244,20 @@ pub fn abis_for_address(addr: &str) -> &'static [&'static str] {
             &["current_committee"],
         ),
         (
+            "0x5af2000000000000000000000000000000000000",
+            &["zone_factory"],
+        ),
+        (
             "0xca11bde05977b3631167028862be2a173976ca11",
             &["multicall3"],
         ),
         ("0x000000000022d473030f116ddee9f6b43ac78ba3", &["permit2"]),
         ("0xba5ed099633d3b313e4d5f7bdc1305d3c28ba5ed", &["createx"]),
         ("0x0000000000000000000000000000000000000a00", &["anchoring"]),
+        (
+            "0x5ad1000000000000000000000000000000000000",
+            &["zone_portal"],
+        ),
     ];
 
     let lowered = addr.trim().to_lowercase();
@@ -252,6 +267,12 @@ pub fn abis_for_address(addr: &str) -> &'static [&'static str] {
     // Every TIP-20 is the same interface at a different address.
     if is_tip20_token(&lowered) {
         return &["tip20", "tip20_roles_auth"];
+    }
+    if lowered
+        .parse::<Address>()
+        .is_ok_and(|a| a.zone_portal_id().is_some())
+    {
+        return &["zone_portal"];
     }
     &[]
 }

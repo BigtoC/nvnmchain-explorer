@@ -1289,3 +1289,37 @@ async fn canonical_contracts_are_named_and_searchable() {
         .iter()
         .any(|f| f["name"] == json!("aggregate3")));
 }
+
+#[tokio::test]
+async fn the_zone_contracts_are_named_with_their_interfaces() {
+    let (_dir, base) = serve(Value::Null).await;
+    let factory = "0x5AF2000000000000000000000000000000000000";
+    let portal = "0x5ad0000000000000000000000000000000000003";
+
+    let (dir, db) = temp_db("zones.db");
+    let label = |address| nvnmchain_explorer::web::address_label(&db, address);
+    for (address, name) in [
+        (factory, "Zone Factory"),
+        (
+            "0x5AD1000000000000000000000000000000000000",
+            "Zone Portal Implementation",
+        ),
+        (portal, "Zone Portal #3"),
+    ] {
+        assert_eq!(label(address).as_deref(), Some(name), "{address}");
+    }
+    // The prefix alone, zone id 0, is no portal: ids start at 1.
+    assert_eq!(label("0x5ad0000000000000000000000000000000000000"), None);
+    drop(dir);
+
+    let page = get_json(&base, &format!("/address/{factory}?tab=contract")).await;
+    assert_eq!(page["interface"]["abis"], json!(["zone_factory"]));
+    assert!(page["interface"]["writes"]
+        .as_array()
+        .expect("writes")
+        .iter()
+        .any(|f| f["name"] == json!("createZone")));
+
+    let page = get_json(&base, &format!("/address/{portal}?tab=contract")).await;
+    assert_eq!(page["interface"]["abis"], json!(["zone_portal"]));
+}

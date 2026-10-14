@@ -853,6 +853,59 @@ static PHRASES: &[Phrase] = &[
         ("Registry", Slot::Value("registryId")),
         ("Record", Slot::Value("checksum")),
     ]),
+    // ---- Zone factory (0x5AF2…) ----------------------------------------
+    phrase(
+        "ZoneCreated(uint32,address,address,bool,bool,address,address[],uint8,address)",
+        "zone created",
+        "Create Zone",
+        &[
+            Slot::Value("zoneId"),
+            Slot::Word("at"),
+            Slot::Account("portal"),
+        ],
+    )
+    .notes(&[
+        ("Admin", Slot::Account("admin")),
+        ("Token", Slot::Token("initialToken")),
+    ]),
+    // ---- Zone portal (0x5AD0… + zone id) -------------------------------
+    phrase(
+        "SequencerSetUpdated(uint64,uint8,address[])",
+        "sequencer set updated",
+        "Update Sequencer Set",
+        &[Slot::Word("with threshold"), Slot::Value("threshold")],
+    )
+    .notes(&[("Nonce", Slot::Value("nonce"))]),
+    phrase(
+        "TokenEnabled(address,string,string,string)",
+        "token enabled",
+        "Enable Token",
+        &[Slot::Token("token")],
+    ),
+    phrase(
+        "RoleUpdated(address,uint8,uint8)",
+        "role updated",
+        "Update Role",
+        &[Slot::Word("for"), Slot::Account("account")],
+    )
+    .notes(&[("From", Slot::Value("prev")), ("To", Slot::Value("next"))]),
+    phrase(
+        "EnforcementModesUpdated(bool,bool)",
+        "enforcement modes updated",
+        "Update Enforcement Modes",
+        &[],
+    )
+    .notes(&[
+        ("Access mode", Slot::Value("accessMode")),
+        ("Gateway mode", Slot::Value("gatewayMode")),
+    ]),
+    phrase(
+        "LeaderUpdated(address,address,uint64,uint64)",
+        "leader updated",
+        "Update Leader",
+        &[Slot::Word("to"), Slot::Account("newLeader")],
+    )
+    .notes(&[("Epoch", Slot::Value("leaderEpoch"))]),
     // ---- Safe ----------------------------------------------------------
     phrase(
         "ProxyCreation(address,address)",

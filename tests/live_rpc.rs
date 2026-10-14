@@ -1,14 +1,13 @@
 //! Integration tests against the live chain RPC.
 //!
-//! These exercise the real node at `NVNM_RPC` (default
-//! `https://rpc.nvnm.canary.mantrachain.dev`): chain metadata, block and tx
+//! These exercise the node [`CHAIN`] names: chain metadata, block and tx
 //! fetching, indexing into SQLite, and the HTTP API end to end.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use nvnmchain_explorer::config::{DEFAULT_CHAIN_ID, DEFAULT_RPC_URL, DEFAULT_WS_URL};
+use nvnmchain_explorer::config::{Role, Settings};
 use nvnmchain_explorer::db::{self, Db, TxColumns};
 use nvnmchain_explorer::indexer::{fetch_block_bundle, index_block};
 use nvnmchain_explorer::rpc::{parse_int_any, ChainRpc};
@@ -24,8 +23,20 @@ fn temp_db() -> (tempfile::TempDir, Db) {
     (dir, Arc::new(Mutex::new(conn)))
 }
 
+/// The node `NVNM_RPC`, `WS_URL` and `CHAIN_ID` name, else NVNM's testnet: the explorer's
+/// default, the canary RPC, answers this suite's bursts with HTTP 429.
+static CHAIN: LazyLock<Settings> = LazyLock::new(|| {
+    let mut chain = Settings::from_env();
+    if std::env::var_os("NVNM_RPC").is_none() && std::env::var_os("TEMPO_RPC").is_none() {
+        chain.rpc_url = "https://rpc.nvnm.testnet.nvnmchain.io".into();
+        chain.ws_url = "wss://ws.nvnm.testnet.nvnmchain.io".into();
+        chain.chain_id = 787_223;
+    }
+    chain
+});
+
 fn rpc() -> ChainRpc {
-    ChainRpc::new(DEFAULT_RPC_URL).expect("rpc client")
+    ChainRpc::new(&CHAIN.rpc_url).expect("rpc client")
 }
 
 /// A recent block that has transactions, and their hashes in block order.
@@ -108,7 +119,7 @@ async fn batched_calls_return_in_order() {
     let chain_id = results[0].as_ref().expect("chain id ok").as_str().unwrap();
     assert_eq!(
         u64::from_str_radix(chain_id.trim_start_matches("0x"), 16).unwrap(),
-        DEFAULT_CHAIN_ID
+        CHAIN.chain_id
     );
     assert!(results[1].as_ref().unwrap().as_str().is_some());
     assert!(results[2].as_ref().unwrap().as_str().is_some());
@@ -184,7 +195,7 @@ async fn head_feed_delivers_blocks() {
     let handle = tokio::spawn(async move {
         nvnmchain_explorer::ws::head_watcher(
             rpc,
-            DEFAULT_WS_URL.to_string(),
+            CHAIN.ws_url.clone(),
             true,
             Duration::from_secs(1),
             tx,
@@ -206,10 +217,10 @@ async fn head_feed_delivers_blocks() {
 }
 
 #[tokio::test]
-async fn chain_metadata_matches_mantra() {
+async fn chain_metadata_matches_the_config() {
     let rpc = rpc();
     let chain_id = rpc.eth_chain_id().await.expect("eth_chainId");
-    assert_eq!(chain_id, DEFAULT_CHAIN_ID, "unexpected chain id");
+    assert_eq!(chain_id, CHAIN.chain_id, "unexpected chain id");
 
     let head = rpc.eth_block_number().await.expect("eth_blockNumber");
     assert!(head > 0, "chain head should be above zero");
@@ -275,12 +286,12 @@ async fn web_api_serves_indexed_data() {
     let head = rpc.eth_block_number().await.expect("head");
     index_block(&rpc, &db, head).await.expect("index tip");
 
-    let cfg = nvnmchain_explorer::config::Settings {
-        role: nvnmchain_explorer::config::Role::All,
-        rpc_url: DEFAULT_RPC_URL.into(),
+    let cfg = Settings {
+        role: Role::All,
+        rpc_url: CHAIN.rpc_url.clone(),
         ws_url: String::new(),
         index_ws: false,
-        chain_id: DEFAULT_CHAIN_ID,
+        chain_id: CHAIN.chain_id,
         host: "127.0.0.1".into(),
         port: 0,
         db_path: "unused".into(),
