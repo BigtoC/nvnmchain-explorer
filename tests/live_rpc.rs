@@ -24,19 +24,20 @@ fn temp_db() -> (tempfile::TempDir, Db) {
 }
 
 /// The node `NVNM_RPC`, `WS_URL` and `CHAIN_ID` name, else NVNM's testnet: the explorer's
-/// default, the canary RPC, answers this suite's bursts with HTTP 429.
+/// default, the canary RPC, answers this suite's bursts with HTTP 429. Testnet
+/// rate-limits too; CI sets `NVNM_RPC_API_KEY`, which its limiter lets through.
 static CHAIN: LazyLock<Settings> = LazyLock::new(|| {
     let mut chain = Settings::from_env();
     if std::env::var_os("NVNM_RPC").is_none() && std::env::var_os("TEMPO_RPC").is_none() {
         chain.rpc_url = "https://rpc.nvnm.testnet.nvnmchain.io".into();
-        chain.ws_url = "wss://ws.nvnm.testnet.nvnmchain.io".into();
+        chain.ws_url = "wss://rpc.nvnm.testnet.nvnmchain.io".into();
         chain.chain_id = 787_223;
     }
     chain
 });
 
 fn rpc() -> ChainRpc {
-    ChainRpc::new(&CHAIN.rpc_url).expect("rpc client")
+    ChainRpc::from_settings(&CHAIN).expect("rpc client")
 }
 
 /// A recent block that has transactions, and their hashes in block order.
@@ -305,6 +306,7 @@ async fn web_api_serves_indexed_data() {
         // The test asserts what this chain says; a third-party directory has
         // no part in that, and would be a network call per page view.
         signature_lookup_url: None,
+        rpc_api_key: CHAIN.rpc_api_key.clone(),
     };
     let tera = web::build_tera(db.clone()).expect("tera");
     let (block_tx, _) = broadcast::channel::<Value>(64);
