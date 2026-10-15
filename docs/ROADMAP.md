@@ -699,7 +699,7 @@ Stage 6     5.15 ─► {6.1 (optional) 6.2} ─► 6.3 (wallet repo) ─► 6.4
 | 0.4           | 0.2                                                                                  | 0.3, 1.1, 1.2                                             |
 | 1.1           | 0.2 (`AppState` lives in `src/web/mod.rs`). Land 0.1 first: 1.1 moves `../src/db.rs` | 0.3, 0.4                                                  |
 | 1.2           | 1.1                                                                                  | 0.4, 3.1                                                  |
-| 1.3, 1.4, 1.5 | 1.2, 0.4 (handlers can `.await`), 0.3 (shared fixtures)                              | each other, 1.6, 1.7, Stage 2, 3.1, Stage 4 as it unlocks |
+| 1.3, 1.4, 1.5 | 1.2, 0.4 (handlers can `.await`), 0.3 (shared fixtures)                              | each other, 1.6, Stage 2, 3.1, Stage 4 as it unlocks      |
 | 1.6           | 1.2                                                                                  | 1.3–1.5, Stage 2, 3.1                                     |
 | 1.7           | 1.3–1.6 (reuses their methods); then drops the legacy handle                         | Stage 2, 3.1, Stage 4                                     |
 | 1.8           | 1.3–1.7 (cleanup; nothing waits on it, PG included)                                  | everything after it                                       |
