@@ -3,9 +3,9 @@
 #   docker compose up -d
 #   psql postgres://explorer:explorer@localhost:5432/explorer
 #
-# A fresh volume runs src/db/schema_pg.sql once on first start. Rerunning it
-# with psql only adds missing tables and indexes; to pick up a changed
-# definition, start over with `docker compose down -v`.
+# A fresh volume runs migrations/postgres/0001_init.sql once on first start.
+# Rerunning it with psql only adds missing tables and indexes; to pick up a
+# changed definition, start over with `docker compose down -v`.
 #
 # Override any default from the shell or a .env file next to this one:
 # POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, POSTGRES_PORT.
@@ -25,7 +25,7 @@ services:
       # From 18 the image keeps its data under /var/lib/postgresql/18/docker
       # and expects the volume on the parent directory.
       - pgdata:/var/lib/postgresql
-      - ./src/db/schema_pg.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./migrations/postgres/0001_init.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     healthcheck:
       # Over TCP: initdb scripts run on a socket-only temporary server, so a
       # socket check would pass before the schema is loaded.
