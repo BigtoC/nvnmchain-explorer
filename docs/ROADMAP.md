@@ -5,6 +5,7 @@
 1. Replace `rusqlite` with an async driver so the same code serves **both** SQLite and PostgreSQL, with no `spawn_blocking` anywhere.
 2. Make `ROLE=INDEXER` / `ROLE=WEB` real, so indexer and web can run as separate processes.
 3. Replace the server-rendered Tera frontend with a React single-page app that talks to a JSON API, switched over in one release.
+4. After the cutover, move the remaining `?format=json` consumers (the wallet) to `/api/v1` and retire the legacy JSON layer.
 
 ## Why sqlx, not SeaORM or Diesel
 
@@ -68,7 +69,7 @@ The frontend comes last:
 | Query style           | Runtime `sqlx::query_as` + `FromRow`, no `query!` macros                                                                       | `query!` binds one database per crate. Revisit for PG-only paths later.                                                                                                                                                                                                       |
 | Backend dispatch      | `enum Db { Sqlite(SqliteDb), Pg(PgDb) }` with async methods that `match`                                                       | Callers never see a driver type.                                                                                                                                                                                                                                              |
 | API contract          | New `/api/v1/*` returning raw data (numbers, hex, unix timestamps). The client does the formatting.                            | The current `?format=json` responses carry display strings (`comma_num`, time-ago, truncated hashes, URLs).                                                                                                                                                                   |
-| Legacy `?format=json` | **Kept, frozen**: same paths, same shape, after the cutover                                                                    | Covers the wallet (cross-origin, `CorsLayer::permissive()`) without needing a list of the paths it calls. Removing it is a later, separate decision once consumers move to `/api/v1`.                                                                                         |
+| Legacy `?format=json` | **Kept, frozen**: same paths, same shape, after the cutover                                                                    | Covers the wallet (cross-origin, `CorsLayer::permissive()`) without needing a list of the paths it calls. Stage 6 moves consumers to `/api/v1`, then removes it.                                                                                         |
 | API types             | `utoipa` OpenAPI spec → `openapi-typescript` generated TS types; interactive docs via `utoipa-scalar` at `/api/v1/docs`        | Keeps Rust DTOs and TS types from drifting apart.                                                                                                                                                                                                                             |
 | Live updates          | SSE stays the live feed. `/api/events` and `/api/v1/events` serve the same stream; the SPA consumes it with `EventSource`      | Events gain `id:` = block number, and `Last-Event-ID` is honoured, so a reconnecting browser gets the blocks it missed (task 4.9).                                                                                                                                            |
 | Tera                  | **Not kept.** Deleted in the cutover release.                                                                                  | Fly.io deploys the SPA from the same `../Dockerfile`; nothing on Fly depends on Tera.                                                                                                                                                                                         |
@@ -637,6 +638,39 @@ Before Tera is deleted, every SPA page must render pixel-identical to the Tera p
 
 ---
 
+## Stage 6 — Retire the legacy `?format=json` layer
+
+Starts once the SPA is fully in production and Tera is deleted (5.15). After that, `?format=json` on an old page path is the only thing those paths answer with JSON; everything else on them is the SPA. The layer still runs its own copy of the old page-handler code (`page_ctx`, server-side `comma_num`, time-ago, truncated hashes) just to produce that shape. Stage 6 moves its consumers to `/api/v1` and then removes it, without breaking anyone along the way.
+
+### 6.1 (If removal is far off) Rebuild the legacy responses on top of `/api/v1`
+- Worth doing only if 6.4 is months away, e.g. the wallet can't move soon. Otherwise the adapters are deleted again shortly after; skip to 6.2 and keep only the golden files from the first step, which 6.2 and 6.4 test against.
+- **First, pin the current output.** For every legacy path and tab, against the fixture server (`examples/serve_fixture.rs`), record the response as a golden file. Time-dependent fields (time-ago strings) are normalised before comparing.
+- Rewrite each legacy response as an adapter: call the same builder the `/api/v1` endpoint uses, then map its DTO to the old shape, formatting display strings the way the old handler did.
+- This deletes the duplicate data-gathering in `src/web/legacy.rs`, so `/api/v1` is the only code that reads the DB for a page.
+- **Done when:** every golden file still matches, and `src/web/legacy.rs` calls no `db::` function directly.
+- **Files:** `src/web/legacy.rs`, `src/api/*` (expose the builders), `tests/legacy.rs` (new), `tests/fixtures/legacy/*.json` (new)
+
+### 6.2 Measure use and announce the successor
+- Count legacy requests per path, with `Origin` / `User-Agent`, in logs and metrics, to find every consumer, not just the wallet.
+- Add to every legacy response:
+  - `Deprecation` ([RFC 9745](https://www.rfc-editor.org/rfc/rfc9745)), marking the path as deprecated.
+  - `Sunset` ([RFC 8594](https://www.rfc-editor.org/rfc/rfc8594)), with the removal date once one is set.
+  - `Link: </api/v1/...>; rel="successor-version"`, pointing to the matching `/api/v1` endpoint.
+- Publish a mapping in `README.md`: each legacy path → its `/api/v1` endpoint, and each display field → the raw field plus the client-side formatter (the SPA's `frontend/src/lib/format.ts` is the reference implementation).
+- **Files:** `src/web/legacy.rs`, `README.md`, `tests/legacy.rs`
+
+### 6.3 Move the wallet to `/api/v1`
+- Done in the wallet's repository: switch each call to the `/api/v1` endpoint from the 6.2 mapping, and format on the client.
+- Confirm with the 6.2 counts that the wallet's traffic on legacy paths has dropped to zero.
+- **Files:** the wallet repo; none here.
+
+### 6.4 Remove the legacy layer
+- **Starts when:** legacy traffic has been zero (or only from consumers that agreed to the date) for an agreed period, e.g. 4 weeks after the `Sunset` date.
+- Delete `src/web/legacy.rs` and its tests.
+- **Don't let JSON clients fall through to the SPA.** Without this, `?format=json` on an old path would get `index.html` with a 200, and a client would fail parsing it with an obscure error. Instead, a JSON request on an old page path gets `410 Gone` with a JSON body `{ "error": { "code": "gone", "message", "successor" } }` naming the `/api/v1` endpoint. The shim is a few lines and can stay indefinitely.
+- `CorsLayer::permissive()` was there for the wallet's cross-origin page calls. Narrow it to `/api/*` (or to the known origins) now that page paths serve only the SPA.
+- **Files:** `src/web/legacy.rs` (delete), `src/web/mod.rs`, `src/web/spa.rs` (the 410 shim), `tests/legacy.rs` → `tests/api.rs`, `README.md`
+
 ## Dependency graph
 
 ```
@@ -651,6 +685,7 @@ Stage 3     1.1 ─► 3.1 ─┬─► 3.2          (separate machines/pods: al
                         └─► 3.3          (probes; live after 1.6 / 1.7)
 Stage 4     1.3 ─► 4.1 ─► {4.2 … 4.9}  (each also needs its own read port)
 Stage 5     5.1 ─► 5.2 ─► 5.3 ─► 5.4 ─► {5.5 … 5.11} ─► 5.12 ─► 5.13 ─► 5.14 + 5.15 (one release)
+Stage 6     5.15 ─► {6.1 (optional) 6.2} ─► 6.3 (wallet repo) ─► 6.4 (after zero legacy traffic)
             (5.1 starts on day one; 5.2 needs 4.1; 5.4 is the pixel-parity gate; each page task needs its endpoint)
 ```
 
@@ -693,6 +728,9 @@ Stage 5     5.1 ─► 5.2 ─► 5.3 ─► 5.4 ─► {5.5 … 5.11} ─► 5.
 | 5.14, 5.15    | built once 4.1 and 4.8 exist; **merged** only after 5.13                             | 5.5–5.12 (developed, not merged)                 |
 | 5.12          | 5.5–5.11                                                                             | 5.14, 5.15 (on their branch)                     |
 | 5.13          | 5.12 and the 5.14 + 5.15 branch                                                      | —                                                |
+| 6.1, 6.2      | 5.15 (Tera is gone, the legacy layer is the last copy of the page code)              | each other                                       |
+| 6.3           | 6.2 (the path → endpoint mapping)                                                    | 6.1                                              |
+| 6.4           | 6.3, and legacy traffic at zero past the `Sunset` date                               | —                                                |
 
 ### Waves
 
@@ -702,6 +740,7 @@ What can be in flight at once, as the work progresses:
 3. **After 1.2, 0.3 and 0.4:** 1.3–1.7 all at once. Stage 4 starts when 1.3 lands (4.1 first), and each endpoint follows its read port. 5.2 → 5.3 → 5.4 start as soon as 4.1 lands, so the pixel-parity gate is in place before the first page.
 4. **After 1.8:** the Stage 2 chain, with 2.8 alongside it. Stages 4 and 5 keep going: SPA pages (5.5–5.11) land as their endpoints do, and the 5.14 + 5.15 branch is built next to them. 3.2 can split onto separate machines or pods once 2.4–2.6 land.
 5. **Finish:** 5.12 (full pixel-parity matrix passes) → 5.13 (staging) → 5.14 + 5.15 merged back to back and released.
+6. **After the cutover:** Stage 6 retires the legacy JSON layer. 6.4 waits on real traffic dropping to zero, so it runs on a calendar, not on other tasks.
 
 ### Notes
 - `{…}` groups are independent of each other and can be reviewed in parallel.
