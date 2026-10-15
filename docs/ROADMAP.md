@@ -187,17 +187,23 @@ Small fixes and mechanical moves with no behavior change. They make every later 
 ### 1.3 Port reads: blocks and transactions
 - Async methods on `Db`; the page handlers `.await` them.
 - Write portable SQL where possible, so Stage 2 copies rather than rewrites: `ON CONFLICT DO NOTHING` instead of `INSERT OR IGNORE`, table-qualified `excluded`, EXISTS read as bool.
-- **Files:** new: `src/db/sqlite/blocks.rs`, `src/db/sqlite/txs.rs`; `src/db/mod.rs`, `src/web/{home,block,tx,render}.rs` (`page_ctx` becomes async), `src/web/feed.rs`, `../tests/pages.rs`
+- Also the indexer's own block reads: `get_latest_block` in `wait_for_seed` and the forward loop, and `get_min_block_number` in the backfill loop.
+- **Files:** new: `src/db/sqlite/blocks.rs`, `src/db/sqlite/txs.rs`; `src/db/mod.rs`, `src/web/{home,block,tx,render}.rs` (`page_ctx` becomes async), `src/web/feed.rs`, `src/indexer.rs` (block reads), `../tests/pages.rs`
 
 ### 1.4 Port reads: addresses, tokens, holders, search
-- **Files:** new: `src/db/sqlite/addresses.rs`, `src/db/sqlite/tokens.rs`; `src/db/mod.rs`, `src/web/{address,token,search}.rs`, `../tests/pages.rs`
+- Also the token-metadata reads in the block and tx handlers (`token_display_map`, `enrich_balance_changes`, `gas_and_fee_ctx`, `block_page`), and the indexer's `get_all_token_addresses` (it seeds the known tokens at start).
+- **Files:** new: `src/db/sqlite/addresses.rs`, `src/db/sqlite/tokens.rs`; `src/db/mod.rs`, `src/web/{address,token,search,block,tx}.rs`, `src/indexer.rs` (`get_all_token_addresses`), `../tests/pages.rs`
 
-### 1.5 Port reads: anchoring, kv, stats, counters
-- **Files:** new: `src/db/sqlite/anchoring.rs`, `src/db/sqlite/kv.rs`; `src/db/mod.rs`, `src/web/anchoring.rs`, `src/web/home.rs`, `../src/signatures.rs`, `src/main.rs` (stats load at `:61`), `tests/anchoring.rs`
+### 1.5 Port anchoring reads, and kv and counters
+- kv reads (`get_kv`, including the indexer's anchoring backfill watermark read) and writes: `set_kv`, and `set_chain_head`, which the indexer calls on every new head (0.1 fixes its swallowed error first).
+- `counter` reads. This task defines `get_kv`, `set_kv` and `counter`; 1.7 only calls them.
+- The stats load in `main.rs` and the stats read in `web::feed`.
+- **Files:** new: `src/db/sqlite/anchoring.rs`, `src/db/sqlite/kv.rs`; `src/db/mod.rs`, `src/web/anchoring.rs`, `src/web/home.rs`, `src/web/feed.rs` (`get_kv("stats")`), `src/indexer.rs` (`set_chain_head`, backfill watermark `get_kv`), `src/main.rs` (stats load at `:61`), `tests/anchoring.rs`
 
 ### 1.6 Port the block write path
 - `save_block_bundles` / `write_block` in one `sqlx` transaction.
 - `adjust_balance`, `apply_transfer_balances`, holder counts, `insert_transfer`, `insert_anchoring`. Keep the "was new" signal via `rows_affected()`.
+- `insert_anchoring` takes the transaction it runs in, so 1.7's backfill can call it too. This task defines it; 1.7 only calls it.
 - The indexer stays the **only writer**. Both the counter arithmetic in `write_block` (`src/db.rs:511-524`: it reads `stored` / `held`, then adds) and the SELECT-then-write in `adjust_balance` depend on it.
 - **No dedicated indexer thread.** The indexer stays a tokio task (`tokio::spawn` in `../src/main.rs`); only its DB calls become `.await`s.
   - sqlx-sqlite runs each connection on its own background OS thread. Async code sends each statement to it over a channel and `.await`s the reply. That is a writer thread fed by a channel, which sqlx provides for every connection.
@@ -209,22 +215,50 @@ Small fixes and mechanical moves with no behavior change. They make every later 
 - **Not covered:** CPU work outside the DB (decoding receipts, building bundles) still runs on the tokio worker. It is small per block. If it shows up as latency during a large backfill, move just that step to a thread, not the whole indexer.
 - **Files:** `src/db/sqlite/write.rs` (new), `src/db/mod.rs`, `../src/indexer.rs` (the batch save and fallback around `:1049`), `tests/anchoring.rs`, `tests/write_scale.rs`
 
-### 1.7 Port maintenance paths
-- `rebuild_token_balances`, `sync_holder_counts`, `save_genesis_balances`, `holders_without_genesis_balance`, the anchoring backfill transaction, and the stats write (`compute_and_store_stats`, which `stats_loop` in the indexer runs every interval).
-- **Files:** `src/db/sqlite/maintenance.rs` (new), `../src/indexer.rs` (raw `db::lock` sites at `:591`, `:680-698`, `:1137`), `src/db/mod.rs`
+### 1.7 Port maintenance paths, then drop the legacy handle
+- Starts after 1.3–1.6: it reuses their methods (`set_kv`, `counter`, `get_kv` from 1.5; `insert_anchoring` from 1.6; block and token reads from 1.3 / 1.4). So it lands last of 1.3–1.7 and is the task that drops the legacy handle.
+- `rebuild_token_balances`, `sync_holder_counts`, `save_genesis_balances`, `holders_without_genesis_balance`.
+- `repair_derived_tables` (runs at every start), including `table_has_rows`.
+- `repair_token_metadata` (runs at every start): `get_all_token_metas` and `save_token_metadata`.
+- The anchoring backfill transaction: `anchoring_event_from_log` (takes a raw `Connection` today) and its `get_block_timestamp` read, plus calls to 1.6's `insert_anchoring` and 1.5's `set_kv` for the watermark, all in one sqlx transaction.
+- The stats write: `compute_and_store_stats` (which `stats_loop` in the indexer runs every interval), calling 1.5's `counter` and `set_kv`, and its `#[cfg(test)]` unit test.
+- **Then drop the legacy handle.** Remove the legacy `Db` field from `AppState`, `Indexer`, `run_forever` and the feed state, and stop calling `init_db` in `main.rs`. The compiler then proves no running code uses rusqlite any more; only tests still do. This, not 1.8, is what lets PG run (Stage 2). It can be a separate small PR right after the maintenance port.
+- **Files:** `src/db/sqlite/maintenance.rs` (new), `../src/indexer.rs` (raw `db::lock` sites at `:591`, `:680-698`, `:1137`; `repair_token_metadata`), `src/db/mod.rs`; for the handle drop: `src/main.rs` (`init_db`), `src/web/mod.rs` (`AppState`), `src/web/feed.rs` (feed state)
 
-### 1.8 Remove rusqlite
+### 1.8 Remove rusqlite (cleanup)
+- By now no running code uses rusqlite (the handle was dropped at the end of 1.7), so this is cleanup and nothing waits on it, PG included.
 - Delete:
   - `src/db/legacy.rs`
   - `type Db = Arc<Mutex<Connection>>` and `lock()`
   - `OrWarn` (replace with explicit error logging, per AGENTS.md)
+- Move the pure helpers out of `legacy.rs` first: `now_ts` (used by `src/parse.rs`, `src/signatures.rs`, `src/indexer.rs`, `src/web`), `page_offset`, `TxColumns`.
 - Drop the `rusqlite` dependency and move all tests to `Db::open`.
-- **Files:** `src/db/legacy.rs` (delete), `../Cargo.toml`, `src/main.rs`, `src/web/mod.rs`, `tests/common/mod.rs`, `tests/decoder.rs`, `tests/baseline.rs`, `tests/anchoring.rs`, `tests/write_scale.rs`, `tests/live_rpc.rs`
+- **Files:** `src/db/legacy.rs` (delete), `../Cargo.toml`, `src/parse.rs`, `src/signatures.rs`, `src/indexer.rs`, `src/web/*` (`now_ts`, `page_offset`, `TxColumns` imports), `tests/common/mod.rs`, `tests/decoder.rs`, `tests/baseline.rs`, `tests/anchoring.rs`, `tests/write_scale.rs`, `tests/live_rpc.rs`
 - **Done when:** `grep -rn "rusqlite\|spawn_blocking" src tests` is empty.
 
 ---
 
 ## Stage 2 — PostgreSQL backend
+
+Postgres doesn't wait for the whole SQLite port. It needs the `Db` enum (1.1), and each PG port follows the SQLite port that defines the same async methods:
+
+| PG task | Needs                 | Pairs with the SQLite port of                         |
+|---------|-----------------------|-------------------------------------------------------|
+| 2.1     | 1.1                   | the `Db` enum and pools                               |
+| 2.2     | 2.1, 1.2              | migrations (`build.rs`, Dockerfile `COPY migrations`) |
+| 2.3     | 2.2, 0.3              | the shared test fixtures                              |
+| 2.4     | 2.3, 1.3, 1.5         | blocks, txs (1.3) and kv, stats (1.5)                 |
+| 2.5     | 2.3, 1.4, 1.5         | addresses, tokens, search (1.4) and anchoring (1.5)   |
+| 2.6     | 2.3, 2.4, 2.5, 1.6, 1.7 | the write path (1.6) and maintenance (1.7); reuses 2.4's kv and 2.5's token PG arms |
+
+So a PG port can land right after its SQLite counterpart, while other resources are still being ported. A small resource can also port both backends in one PR, within the PR size rule.
+
+**PG runs before 1.8.** 1.8 only deletes code nothing runs any more. PG can run in production once:
+1. **2.1 is set up correctly:** under a `postgres://` `DB_URI` the process never opens SQLite: no `init_db`, no SQLite file. Nothing needs an `Option` for this. While the legacy handle still exists, the startup guard stops a PG process before any database is opened, and by the time the guard comes off the handle is gone (condition 3). Never work around the guard with an in-memory placeholder connection: legacy calls go through `OrWarn`, which would turn a missed port into empty pages with only a `warn!` log.
+2. **2.4–2.6 have landed** (each follows its SQLite port, so 1.3–1.7 are in too), with no `Db::Pg` arm still a `bail!`.
+3. **The legacy handle is gone from running code** (end of 1.7), so the compiler, not a grep, proves nothing in PG mode can reach rusqlite.
+
+Until then, PG code still lands early and is tested through the test matrix (2.3), which calls `Db` directly, and a `postgres://` `DB_URI` is a startup error ("the PostgreSQL backend is not complete yet"). The PR that completes the three conditions removes that guard; from then a deployment can run on PG (3.2).
 
 ### 2.1 Configuration and the `Pg` variant
 - Add `DB_URI` to `Settings`. Its scheme selects the backend:
@@ -241,6 +275,9 @@ Small fixes and mechanical moves with no behavior change. They make every later 
   - These are not libpq's `PGUSER` / `PGPASSWORD` / `PGDATABASE`, which `PgConnectOptions` reads from the environment by itself. Setting the three fields explicitly makes the `PG_*` values win.
   - `PG_PASSWORD` never prints: give it a redacting `Debug`, as `rpc_api_key` has since #61. The startup log (`src/main.rs:33-36`, which prints `cfg.db_path` today) shows the backend and host only.
 - `Db::Pg(PgDb)` with a `PgPool`. Every not-yet-ported method `bail!`s explicitly; none falls back silently to a default.
+- From here on, every 1.x PR that adds a `Db` method also adds its `Db::Pg` arm, as a `bail!` until the matching 2.x port lands.
+- In PG mode, `main.rs` runs the guard before opening any database and never calls `init_db`. Once the guard comes off (legacy handle gone at the end of 1.7), it builds only the `Db::Pg` handle.
+- Add the startup guard described above: a `postgres://` `DB_URI` refuses to start until the three conditions hold.
 - **Files:** `../Cargo.toml` (sqlx `postgres`), `src/config.rs`, `.env.example`, `deploy/nvnmchain-explorer.env.example`, `README.md`, `src/db/mod.rs`, `src/db/pg/mod.rs` (new), `src/main.rs`
 
 ### 2.2 PG migrations
@@ -249,6 +286,7 @@ Small fixes and mechanical moves with no behavior change. They make every later 
 - Freeze `0001_init.sql` once this lands. sqlx records each migration's checksum and refuses to start if an applied file changes, so later schema changes go in `0002_*.sql` and onward.
 - A local volume created by the old init script has the tables but no `_sqlx_migrations` row. The migrator reruns 0001 there, which works because every statement is `IF NOT EXISTS`. The same goes for any PG database created before 2.2.
 - The Dockerfile and `build.rs` already cover `migrations/postgres/` from 1.2.
+- No counter seeding on PG: `seed_counters` exists for old SQLite files. A fresh PG database starts empty (it indexes from genesis), `add_to_counter` upserts, and `counter` reads a missing row as 0.
 - **Files:** `src/db/pg/mod.rs`, `docker-compose.yml`
 
 ### 2.3 Test matrix
@@ -259,6 +297,7 @@ Small fixes and mechanical moves with no behavior change. They make every later 
 - **Files:** `tests/common/mod.rs`, `../tests/pages.rs`, `tests/anchoring.rs`, `.github/workflows/ci.yml`, `AGENTS.md`
 
 ### 2.4 PG reads: blocks, txs, kv, stats
+- Includes the kv reads and writes from 1.5 (`get_kv`, `set_kv`, `set_chain_head`, `counter`) and the indexer's block reads from 1.3.
 - Dialect differences:
   - `$N` binds
   - typed NULLs in `TX_LIST_COLS`
@@ -269,12 +308,15 @@ Small fixes and mechanical moves with no behavior change. They make every later 
 ### 2.5 PG reads: addresses, tokens, anchoring, search
 - Case-insensitive token search: `lower(col) = lower($1 COLLATE "C")`, or `ILIKE` with `pg_trgm`, replacing `COLLATE NOCASE` / `LIKE`.
 - `= ANY($1)` instead of the variable-length `IN` lists.
+- Includes the token-metadata reads in the block and tx handlers and `get_all_token_addresses` (1.4).
 - **Files:** new: `src/db/pg/addresses.rs`, `src/db/pg/tokens.rs`, `src/db/pg/anchoring.rs`; `src/db/mod.rs`
 
 ### 2.6 PG write path
 - Batched `UNNEST(...) ON CONFLICT` upserts; balances pre-read in one query per block batch.
 - `pg_advisory_xact_lock` as a guard against two indexers.
-- Maintenance paths (`rebuild_token_balances`, `sync_holder_counts`, genesis).
+- Reuses the PG kv arms from 2.4 (`set_kv`, `counter`) and token arms from 2.5, as 1.7 reuses their SQLite counterparts.
+- Maintenance paths, everything 1.7 lists: `rebuild_token_balances`, `sync_holder_counts`, genesis, `repair_derived_tables` (`table_has_rows`), `repair_token_metadata` (`save_token_metadata`), the anchoring backfill transaction, and `compute_and_store_stats`.
+- `compute_and_store_stats` uses a derived table without an alias (`FROM blocks, (SELECT MAX(timestamp) - ?1 AS start FROM blocks)`), which PG accepts only from 16. CI runs `postgres:18`; give it an alias anyway so older servers work too.
 - **Files:** new: `src/db/pg/write.rs`, `src/db/pg/maintenance.rs`; `src/db/mod.rs`, `../tests/write_scale.rs` (PG run)
 
 ### 2.7 Backend-agnostic baseline
@@ -296,7 +338,7 @@ Small fixes and mechanical moves with no behavior change. They make every later 
 
 ## Stage 3 — Make `ROLE` real and split the deployment
 
-Needs only task 1.1 (`ReadMode` on `Db`), so it can run in parallel with the rest of Stages 1–2.
+3.1 needs only task 1.1 (`ReadMode` on `Db`), so it runs in parallel with the rest of Stages 1–2. 3.3 also needs 1.2 (schema check). 3.2 splitting onto separate machines or pods needs PG to be runnable (Stage 2 intro).
 
 ### 3.1 Honour `ROLE`
 - `WEB`: no indexer loops; DB opened `ReadOnly` (SQLite `read_only(true)`, PG `default_transaction_read_only = on`).
@@ -309,7 +351,7 @@ Needs only task 1.1 (`ReadMode` on `Db`), so it can run in parallel with the res
 
 ### 3.2 Deployment split
 - Run indexer and web as separate processes or services.
-- **Fly.io constraint:** a Fly volume attaches to one machine, and each process group in `../fly.toml` runs on its own machines. With SQLite, Fly keeps `ROLE=ALL` on a single machine. Splitting `INDEXER` and `WEB` onto separate Fly machines requires the Postgres backend (Stage 2), either Fly Managed Postgres or an external one.
+- **Fly.io constraint:** a Fly volume attaches to one machine, and each process group in `../fly.toml` runs on its own machines. With SQLite, Fly keeps `ROLE=ALL` on a single machine. Splitting `INDEXER` and `WEB` onto separate Fly machines requires PG to be runnable (Stage 2 intro: 2.4–2.6 landed and the legacy handle dropped at the end of 1.7; not 1.8), on Fly Managed Postgres or an external one.
 - **Files:** `../fly.toml`, `render.yaml`, `deploy/entrypoint.sh`, `deploy/nvnmchain-explorer.service`, `deploy/install.sh`, `docker-compose.yml`, `README.md`
 
 ### 3.3 Kubernetes probes: liveness, readiness, startup
