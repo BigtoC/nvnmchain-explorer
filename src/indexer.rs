@@ -25,7 +25,7 @@ use crate::db::{self, Db};
 use crate::decoder::{checksum_address, decode_event, DecodedEvent};
 use crate::models::{AnchoringEvent, BlockBundle, Transaction, TransferEvent};
 use crate::parse::{parse_block, parse_transaction};
-use crate::rpc::ChainRpc;
+use crate::rpc::{ChainRpc, RpcError};
 use crate::summary::ZERO_ADDRESS;
 use crate::tokens::{fetch_token_metadata, has_control_chars};
 
@@ -146,6 +146,8 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
 
 /// Fetch `nums` in one HTTP request of `eth_getBlockByNumber`, then a second
 /// request of `eth_getBlockReceipts` only for blocks that have transactions.
+/// A range the node answers with one error, as reth does past its response size cap, is fetched
+/// in halves; a request that fails outright is not retried.
 async fn fetch_raw_blocks(
     rpc: &ChainRpc,
     nums: RangeInclusive<u64>,
@@ -162,7 +164,17 @@ async fn fetch_raw_blocks(
             )
         })
         .collect();
-    let results = rpc.batch_call(calls).await?;
+    let results = match rpc.batch_call(calls).await {
+        Err(e) if e.is::<RpcError>() && nums.start() < nums.end() => {
+            let (from, to) = nums.into_inner();
+            let mid = from + (to - from) / 2;
+            info!("blocks {from}..={to} refused ({e}); fetching in halves");
+            let mut blocks = Box::pin(fetch_raw_blocks(rpc, from..=mid)).await?;
+            blocks.extend(Box::pin(fetch_raw_blocks(rpc, mid + 1..=to)).await?);
+            return Ok(blocks);
+        }
+        results => results?,
+    };
 
     let mut blocks = Vec::with_capacity(results.len());
     let mut need_receipts = Vec::new();
@@ -253,7 +265,8 @@ fn without_missing_receipts(blocks: Vec<(Value, Option<Value>)>) -> Vec<(Value, 
         .collect()
 }
 
-async fn fetch_block_bundles(
+/// The bundles for `nums`; tokens in `known_tokens` are not described again.
+pub async fn fetch_block_bundles(
     rpc: &ChainRpc,
     known_tokens: Arc<Mutex<HashSet<String>>>,
     nums: RangeInclusive<u64>,
@@ -1117,7 +1130,7 @@ async fn stats_loop(db: Db, interval: Duration, mut shutdown: watch::Receiver<bo
     }
 }
 
-/// Minutes of activity the home page charts.
+/// Minutes of activity the home page charts and averages.
 const CHART_MINUTES: usize = 60;
 
 fn compute_and_store_stats(db: &Db) -> Result<Value> {
@@ -1141,45 +1154,6 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
         |r| r.get(0),
     )?;
 
-    // Rolling window over the newest blocks (cheap PK scan, no history sweep).
-    // Timestamps are ms-precision (`timestamp_ms`); the chain produces blocks
-    // faster than once per second, so second-granularity timestamps would
-    // quantize the block time to 1s.
-    let window: i64 = 100;
-    let (min_ms, max_ms, tx_sum, gas_sum, gas_den, n): (i64, i64, i64, f64, f64, i64) = conn
-        .query_row(
-            "SELECT MIN(timestamp_ms), MAX(timestamp_ms), SUM(tx_count),
-                    SUM(CASE WHEN gas_limit > 0 THEN gas_used * 1.0 / gas_limit ELSE 0 END),
-                    SUM(CASE WHEN gas_limit > 0 THEN 1 ELSE 0 END),
-                    COUNT(*)
-             FROM (SELECT timestamp_ms, tx_count, gas_used, gas_limit
-                   FROM blocks ORDER BY number DESC LIMIT ?1)",
-            params![window],
-            |r| {
-                Ok((
-                    r.get::<_, Option<i64>>(0)?.unwrap_or(0),
-                    r.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                    r.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                    r.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
-                    r.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
-                    r.get::<_, Option<i64>>(5)?.unwrap_or(0),
-                ))
-            },
-        )
-        .unwrap_or((0, 0, 0, 0.0, 0.0, 0));
-
-    let span_ms = (max_ms - min_ms).max(1) as f64;
-    let avg_block_time_ms = if n > 1 { span_ms / (n - 1) as f64 } else { 0.0 };
-    let tps = if span_ms > 0.0 {
-        tx_sum as f64 / span_ms * 1000.0
-    } else {
-        0.0
-    };
-    let gas_util_pct = if gas_den > 0.0 {
-        gas_sum / gas_den * 100.0
-    } else {
-        0.0
-    };
     let latest_block = conn.query_row("SELECT MAX(number) FROM blocks", [], |r| {
         r.get::<_, Option<i64>>(0)
     })?;
@@ -1200,23 +1174,36 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
         0.0
     };
 
-    // Transactions and gas in each minute of the last hour, oldest first.
-    // The hour ends at the newest block, so a lagging index still has data.
+    // Each minute of the hour before the newest block, oldest first: the charts
+    // plot it and the tiles average it. A lagging index still has data.
     let mut tx_per_minute = vec![0_i64; CHART_MINUTES];
     let mut gas_per_minute = vec![0_i64; CHART_MINUTES];
+    let (mut blocks, mut gas_limit, mut first_ms, mut last_ms) = (0, 0, i64::MAX, 0);
     let mut minutes = conn.prepare(
-        "SELECT (timestamp - start - 1) / 60, SUM(tx_count), SUM(gas_used)
+        "SELECT (timestamp - start - 1) / 60, SUM(tx_count), SUM(gas_used),
+                COUNT(*), SUM(gas_limit), MIN(timestamp_ms), MAX(timestamp_ms)
          FROM blocks, (SELECT MAX(timestamp) - ?1 AS start FROM blocks)
          WHERE timestamp > start GROUP BY 1",
     )?;
-    let rows = minutes.query_map(params![60 * CHART_MINUTES as i64], |r| {
-        Ok((r.get::<_, usize>(0)?, r.get(1)?, r.get(2)?))
-    })?;
-    for row in rows {
-        let (minute, txs, gas) = row?;
-        tx_per_minute[minute] = txs;
-        gas_per_minute[minute] = gas;
+    let mut rows = minutes.query(params![60 * CHART_MINUTES as i64])?;
+    while let Some(r) = rows.next()? {
+        let minute: usize = r.get(0)?;
+        tx_per_minute[minute] = r.get(1)?;
+        gas_per_minute[minute] = r.get(2)?;
+        blocks += r.get::<_, i64>(3)?;
+        gas_limit += r.get::<_, i64>(4)?;
+        first_ms = first_ms.min(r.get(5)?);
+        last_ms = last_ms.max(r.get(6)?);
     }
+    // Millisecond timestamps, since sub-second blocks share a whole second.
+    let span_ms = (last_ms - first_ms).max(0) as f64;
+    let ratio = |n: f64, d: f64| if d > 0.0 { n / d } else { 0.0 };
+    let avg_block_time_ms = ratio(span_ms, (blocks - 1) as f64);
+    let tps = ratio(tx_per_minute.iter().sum::<i64>() as f64 * 1000.0, span_ms);
+    let gas_util_pct = ratio(
+        gas_per_minute.iter().sum::<i64>() as f64 * 100.0,
+        gas_limit as f64,
+    );
 
     let stats = serde_json::json!({
         "latest_block": latest_block,
@@ -1246,7 +1233,7 @@ mod tests {
 
     /// Each block counts in the minute it falls in, counted back from the newest.
     #[test]
-    fn activity_is_charted_per_minute_back_from_the_newest_block() {
+    fn the_hour_before_the_newest_block_is_charted_and_averaged() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("stats.db");
         let db: Db = Arc::new(Mutex::new(db::init_db(path.to_str().unwrap()).unwrap()));
@@ -1261,8 +1248,9 @@ mod tests {
         for (number, timestamp, txs) in blocks {
             db::lock(&db)
                 .execute(
-                    "INSERT INTO blocks (number, hash, parent_hash, timestamp, tx_count, gas_used)
-                     VALUES (?1, ?1, ?1, ?2, ?3, ?3 * 10)",
+                    "INSERT INTO blocks (number, hash, parent_hash, timestamp, timestamp_ms,
+                                         tx_count, gas_used, gas_limit)
+                     VALUES (?1, ?1, ?1, ?2, ?2 * 1000, ?3, ?3 * 10, 1000)",
                     params![number, timestamp, txs],
                 )
                 .unwrap();
@@ -1275,6 +1263,64 @@ mod tests {
         assert_eq!((txs[0], txs[58], txs[59]), (1, 2, 7));
         assert_eq!(txs.iter().sum::<i64>(), 10);
         assert_eq!(stats["gas_per_minute"][59], 70);
+
+        // The tiles average the same hour: 10 transactions and 100 of 4,000 gas
+        // over the 3,599 s from the first block in it to the newest.
+        let close = |k: &str, want: f64| (stats[k].as_f64().unwrap() - want).abs() < 1e-9;
+        assert!(close("tps", 10.0 / 3599.0), "{stats}");
+        assert!(close("gas_util_pct", 2.5));
+        assert!(close("avg_block_time_ms", 3_599_000.0 / 3.0));
+    }
+
+    #[tokio::test]
+    async fn a_refused_range_is_fetched_in_halves() {
+        use axum::{routing::post, Json, Router};
+
+        // Like reth past its response size cap: one error, not an array.
+        let handler = |Json(body): Json<Value>| async move {
+            let answer = |c: &Value| {
+                let block = json!({"number": c["params"][0], "transactions": []});
+                json!({"jsonrpc": "2.0", "id": c["id"], "result": block})
+            };
+            Json(match &body {
+                Value::Array(calls) if calls.len() > 2 => {
+                    json!({"jsonrpc": "2.0", "id": null, "error": {
+                        "code": -32011, "message": "The batch response was too large",
+                    }})
+                }
+                Value::Array(calls) => Value::Array(calls.iter().map(answer).collect()),
+                call => answer(call),
+            })
+        };
+        let rpc = ChainRpc::test_node(Router::new().route("/", post(handler))).await;
+
+        let blocks = fetch_raw_blocks(&rpc, 1..=7).await.unwrap();
+        let numbers: Vec<_> = blocks
+            .iter()
+            .map(|(b, _)| b["number"].as_str().unwrap())
+            .collect();
+        assert_eq!(numbers, ["0x1", "0x2", "0x3", "0x4", "0x5", "0x6", "0x7"]);
+    }
+
+    /// Halving a request the node did not answer would multiply the load on a node that is down.
+    #[tokio::test]
+    async fn a_failed_request_is_not_retried_in_halves() {
+        use axum::{http::StatusCode, routing::post, Router};
+        use std::sync::atomic::AtomicUsize;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        let handler = move || {
+            let counted = counted.clone();
+            async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                StatusCode::BAD_GATEWAY
+            }
+        };
+        let rpc = ChainRpc::test_node(Router::new().route("/", post(handler))).await;
+
+        assert!(fetch_raw_blocks(&rpc, 1..=7).await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     fn chunks(from: u64, to: u64, batch: u64) -> Vec<RangeInclusive<u64>> {
