@@ -312,22 +312,23 @@ Needs only task 1.1 (`ReadMode` on `Db`), so it can run in parallel with the res
 - **Files:** `../fly.toml`, `render.yaml`, `deploy/entrypoint.sh`, `deploy/nvnmchain-explorer.service`, `deploy/install.sh`, `docker-compose.yml`, `README.md`
 
 ### 3.3 Kubernetes probes: liveness, readiness, startup
-Following the [Kubernetes probe guide](https://kubernetes.io/docs/concepts/workloads/pods/probes/). Each probe answers one question, so each gets its own endpoint, kept apart from `/healthz` (4.1), which is a detailed report for people and monitoring:
+Following the [Kubernetes probe guide](https://kubernetes.io/docs/concepts/workloads/pods/probes/). All three roles are the same binary, so every role serves every endpoint below; what differs per role is what an endpoint waits for, and which probes the deployment configures. Each probe answers one question, so each gets its own endpoint, kept apart from `/healthz` (4.1), which is a detailed report for people and monitoring:
 
-| Endpoint    | Question                   | 200 when                                                                                                                                                            | Never checks                          |
-|-------------|----------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------|
-| `/startupz` | Has it finished starting?  | Migrations are applied, the listener is up, and the boot RPC check has passed once: `eth_chainId` answered and matches `CHAIN_ID`. Sticky: once true it stays true. | the indexed tip                       |
-| `/livez`    | Is the process wedged?     | The runtime answers HTTP. For a role that runs the indexer: its loop has ticked within `INDEXER_STALL_SECONDS` (default 300).                                       | the DB, the RPC node, the indexed tip |
-| `/readyz`   | Should it get traffic now? | The DB answers a `SELECT 1` within ~1 s, the schema is at the latest migration the binary embeds, and shutdown has not started.                                     | the RPC node, the indexed tip         |
+| Endpoint    | Question                   | 200 when                                                                                                                                                                                        | Never checks                          |
+|-------------|----------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------|
+| `/startupz` | Has it finished starting?  | Migrations are applied and the listener is up. `INDEXER` / `ALL` also wait for the boot RPC check to pass once: `eth_chainId` answered and matches `CHAIN_ID`. Sticky: once true it stays true. | the indexed tip                       |
+| `/livez`    | Is the process wedged?     | The runtime answers HTTP. For a role that runs the indexer: its loop has ticked within `INDEXER_STALL_SECONDS` (default 300).                                                                   | the DB, the RPC node, the indexed tip |
+| `/readyz`   | Should it get traffic now? | The DB answers a `SELECT 1` within ~1 s, the schema is at the latest migration the binary embeds, and shutdown has not started.                                                                 | the RPC node, the indexed tip         |
 
 - **Liveness only catches what a restart fixes.** The guide warns that a liveness probe tied to dependencies or load causes cascading restarts.
   - A database or RPC outage must not restart pods. A database outage makes `/readyz` fail, and pods come back on their own once it recovers.
   - The indexer heartbeat ticks on every loop iteration, including retries and backoff after RPC errors. So it fails only when the loop is truly stuck, not while the chain or the RPC node is slow.
-- **The RPC node is checked at startup, in all three roles.** It is the system's key dependency, so a pod that can't reach it, or reaches the wrong chain, should never start serving or indexing:
-  - At boot, every role calls `eth_chainId` and compares it with `CHAIN_ID`. It retries with backoff until it succeeds; `/startupz` turns 200 only after that, together with migrations. `WEB` makes the call too, even though it otherwise only touches the RPC node for a few pages.
-  - This catches a wrong `NVNM_RPC` URL, a missing or wrong `NVNM_RPC_API_KEY`, a node on the wrong network, or an RPC outage at deploy time. In a rolling update the new pods never pass startup, so the old pods keep serving and `kubectl rollout status` fails the deploy.
+- **The RPC node is checked at startup in the roles that index (`INDEXER`, `ALL`).** It is the system's key dependency, so an indexer that can't reach it, or reaches the wrong chain, should never start:
+  - At boot, these roles call `eth_chainId` and compare it with `CHAIN_ID`. They retry with backoff until it succeeds; `/startupz` turns 200 only after that, together with migrations.
+  - This catches a wrong `NVNM_RPC` URL, a missing or wrong `NVNM_RPC_API_KEY`, a node on the wrong network, or an RPC outage at deploy time. In a rolling update the new pods never pass startup, so the old pods keep running and `kubectl rollout status` fails the deploy.
+  - **`WEB` is not gated on the RPC node**, so it keeps serving indexed data from the DB during an RPC outage, including on a pod that is rescheduled (node drain, scale-up, OOM) while the node is down. It still calls `eth_chainId` once in the background at boot and logs a `warn!` on failure or a chain-id mismatch, without blocking startup. Its `/startupz` doesn't wait for that call. A `WEB` deployment also doesn't need to configure a startup probe: it runs no migrations and starts in seconds, and readiness already keeps it out of rotation until the schema is current.
   - It runs only until it passes. After startup, an RPC outage doesn't affect any probe: liveness or readiness tied to the shared RPC node would restart or unroute every pod at once without fixing anything, so it shows up in `/healthz` and alerting (4.1) instead.
-  - **Tradeoff:** during an RPC outage, a `WEB` pod that is rescheduled (node drain, scale-up, OOM) can't come back, although it could serve pages from the DB. Keep `WEB` at 2+ replicas with a `PodDisruptionBudget`, so a drain never takes them all at once.
+  - **Tradeoff for `ALL`:** it also serves the site, so during an RPC outage a rescheduled `ALL` pod can't come back, although it could serve pages from the DB. Where that matters, run `WEB` pods for serving and keep `ALL` for single-machine setups (Fly with SQLite).
   - **No probe calls the RPC node itself.** Probes run every few seconds on every pod, and the RPC is rate-limited (#61). The boot task makes the call once per pod start (plus retries), and the probe reads its result. `ChainRpc` also records the time of its last successful response and its last error, for `/healthz`.
 - **A stale tip is not a probe failure.** If the indexer falls behind, every web pod sharing the database would go unready at once, taking the whole site down instead of serving slightly old data. Tip age stays in `/healthz` for alerting.
 - **Readiness and the schema:**
@@ -337,10 +338,10 @@ Following the [Kubernetes probe guide](https://kubernetes.io/docs/concepts/workl
 - **Startup:** the HTTP listener binds first and serves only the probe routes until startup completes. The startup probe hits `/startupz`, which also implies everything `/livez` checks. Its `failureThreshold × periodSeconds` must cover the slowest start, including RPC retries: SQLite's 0001 can rebuild indexes on an old, large database, and a large PG migration can take minutes. Liveness and readiness don't run until it passes.
 - **Before Stage 1 lands,** a long block write blocks the single tokio worker, and `/livez` would time out mid-write. Probes go live after 1.6 / 1.7, or until then with a liveness `timeoutSeconds × failureThreshold` above the longest write.
 - **Per role:**
-  - `WEB`: startup (with the RPC check), liveness and readiness. Readiness gates the Service.
+  - `WEB`: configure liveness and readiness. A startup probe isn't needed, since `WEB` starts in seconds, but `/startupz` still answers. Readiness gates the Service. Run 2+ replicas with a `PodDisruptionBudget`, so a drain never takes them all at once.
   - `INDEXER`: startup (with the RPC check) and liveness. It gets no Service traffic, so readiness only matters as a signal. Run one replica, since the indexer is the only writer (`pg_advisory_xact_lock` from 2.6 guards against a second one).
   - `ALL`: all three, startup with the RPC check.
-- Example container spec, documented in `README.md`. Thresholds are a starting point, to be tuned against measured start and write times:
+- Example container spec for `INDEXER` / `ALL`, documented in `README.md`. A `WEB` deployment can leave out `startupProbe`. Thresholds are a starting point, to be tuned against measured start and write times:
   ```yaml
   startupProbe:
     httpGet: { path: /startupz, port: 8080 }
@@ -363,7 +364,8 @@ Following the [Kubernetes probe guide](https://kubernetes.io/docs/concepts/workl
   - `/livez` stays 200 with the DB gone.
   - `/readyz` turns 503 with the DB gone, with the schema one migration behind, and after shutdown starts.
   - A stuck indexer heartbeat fails `/livez`.
-  - In every role, `/startupz` stays 503 while the stub RPC node is down or reports a different chain id, and turns 200 once it answers with `CHAIN_ID`.
+  - For `INDEXER` and `ALL`, `/startupz` stays 503 while the stub RPC node is down or reports a different chain id, and turns 200 once it answers with `CHAIN_ID`.
+  - With the stub RPC node down, `WEB` starts, and both its `/startupz` and its `/readyz` return 200.
   - After startup, a stub RPC node that stops answering leaves `/livez`, `/readyz` and `/startupz` at 200, and only `/healthz` reports it.
 - **Files:**
   - new: `src/probes.rs` (routes, indexer heartbeat, schema check, boot RPC check)
