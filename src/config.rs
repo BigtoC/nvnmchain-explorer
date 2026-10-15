@@ -5,8 +5,10 @@
 use std::env;
 use std::fmt;
 
+use reqwest::header::HeaderValue;
+
 pub const DEFAULT_RPC_URL: &str = "https://rpc.nvnm.canary.mantrachain.dev";
-pub const DEFAULT_WS_URL: &str = "wss://ws.nvnm.canary.mantrachain.dev";
+pub const DEFAULT_WS_URL: &str = "wss://rpc.nvnm.canary.mantrachain.dev";
 /// Chain id reported by the RPC above (`eth_chainId` → 0xc0316).
 pub const DEFAULT_CHAIN_ID: u64 = 787_222;
 pub const DEFAULT_PORT: u16 = 8080;
@@ -74,6 +76,10 @@ pub struct Settings {
     /// Answers are cached in memory, misses included. `None` disables it
     /// — the explorer then never talks to a third party.
     pub signature_lookup_url: Option<String>,
+    /// Sent as `x-api-key` on every JSON-RPC request, so the node's rate
+    /// limiter can let this client through. Marked sensitive: `Debug` prints
+    /// `Sensitive`, never the key.
+    pub rpc_api_key: Option<HeaderValue>,
 }
 
 /// OpenChain's signature directory, queried at most once per selector per
@@ -146,6 +152,7 @@ impl Settings {
             native_symbol: env_or("NATIVE_SYMBOL", "NVNM"),
             stats_interval_seconds: env_f64("STATS_INTERVAL_SECONDS", 5.0).clamp(1.0, 3600.0),
             signature_lookup_url: signature_lookup_url(),
+            rpc_api_key: rpc_api_key(env::var("NVNM_RPC_API_KEY").ok()),
         }
     }
 }
@@ -172,6 +179,26 @@ fn signature_lookup_url() -> Option<String> {
         Ok(url) if url.trim().is_empty() => None,
         Ok(url) => Some(url.trim().to_string()),
         Err(_) => Some(DEFAULT_SIGNATURE_LOOKUP_URL.to_string()),
+    }
+}
+
+/// The `x-api-key` to send, from `NVNM_RPC_API_KEY`. Unset or empty means none:
+/// a workflow secret GitHub withholds, as it does from fork PRs, arrives empty.
+fn rpc_api_key(raw: Option<String>) -> Option<HeaderValue> {
+    let raw = raw?;
+    let key = raw.trim();
+    if key.is_empty() {
+        return None;
+    }
+    match HeaderValue::from_str(key) {
+        Ok(mut value) => {
+            value.set_sensitive(true);
+            Some(value)
+        }
+        Err(_) => {
+            tracing::warn!("NVNM_RPC_API_KEY is not a valid header value; sending no x-api-key");
+            None
+        }
     }
 }
 
@@ -208,5 +235,25 @@ mod tests {
         for role in [Role::All, Role::Indexer, Role::Web] {
             assert_eq!(Role::parse(&role.to_string()), Some(role));
         }
+    }
+
+    #[test]
+    fn an_empty_api_key_is_no_api_key() {
+        assert!(rpc_api_key(None).is_none());
+        assert!(rpc_api_key(Some(String::new())).is_none());
+        assert!(rpc_api_key(Some("  \n".into())).is_none());
+    }
+
+    #[test]
+    fn an_api_key_is_trimmed_and_never_printed() {
+        let key = rpc_api_key(Some(" s3cret\n".into())).expect("key");
+        assert_eq!(key, "s3cret");
+        assert!(key.is_sensitive());
+        assert!(!format!("{key:?}").contains("s3cret"));
+    }
+
+    #[test]
+    fn an_api_key_a_header_cannot_carry_is_dropped() {
+        assert!(rpc_api_key(Some("bad\u{7f}key".into())).is_none());
     }
 }
