@@ -643,29 +643,6 @@ fn burnt_fees_wei(base_fee: &str, gas_used: i64) -> String {
     (base * BigInt::from(gas_used.max(0))).to_string()
 }
 
-/// SVG polyline points for a 160×32 sparkline.
-fn sparkline(values: &[f64]) -> String {
-    if values.is_empty() {
-        return String::new();
-    }
-    let max = values.iter().cloned().fold(0.0_f64, f64::max).max(1.0);
-    let n = values.len();
-    let pts: Vec<String> = values
-        .iter()
-        .enumerate()
-        .map(|(i, v)| {
-            let x = if n == 1 {
-                80.0
-            } else {
-                i as f64 / (n - 1) as f64 * 160.0
-            };
-            let y = 30.0 - (v / max * 26.0);
-            format!("{x:.1},{y:.1}")
-        })
-        .collect();
-    pts.join(" ")
-}
-
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -698,24 +675,6 @@ pub async fn home(
         o.insert("tps_display".into(), json!(format!("{tps:.2}")));
         o.insert("gas_util_display".into(), json!(format!("{gas:.1}%")));
     }
-    let spark_tx = sparkline(
-        &recent_blocks
-            .iter()
-            .map(|b| b.tx_count as f64)
-            .collect::<Vec<_>>(),
-    );
-    let spark_gas = sparkline(
-        &recent_blocks
-            .iter()
-            .map(|b| {
-                if b.gas_limit > 0 {
-                    b.gas_used as f64 / b.gas_limit as f64 * 100.0
-                } else {
-                    0.0
-                }
-            })
-            .collect::<Vec<_>>(),
-    );
 
     // Index progress rides in the same stats payload, so the tiles and the
     // bar cost no per-view aggregates either.
@@ -751,8 +710,6 @@ pub async fn home(
             "indexed_display": comma_num(indexed_count),
             "head_display": comma_num(chain_head),
             "index_pct_display": format!("{index_pct:.1}"),
-            "spark_tx": spark_tx,
-            "spark_gas": spark_gas,
         }),
     );
     html_or_json(&state, &headers, &query, "home.html", &ctx)

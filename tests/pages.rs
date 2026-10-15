@@ -513,6 +513,32 @@ async fn a_token_the_index_has_not_met_is_shown_and_not_stored() {
     assert_eq!(get_json(&base, "/tokens?").await["total"], before);
 }
 
+/// The activity charts draw the stats' series, and are left out until the
+/// stats have one.
+#[tokio::test]
+async fn the_activity_charts_draw_the_stats_series() {
+    let stats = json!({ "latest_block": 101, "total_txns": 3, "token_count": 1 });
+    let mut series = stats.clone();
+    series["tx_per_minute"] = json!([0, 2, 1]);
+    series["gas_per_minute"] = json!([0, 42000, 21000]);
+    let (_dir, base) = serve(series).await;
+    let page = reqwest::get(format!("{base}/")).await.expect("home");
+    let page = page.text().await.expect("html");
+    assert!(page.contains(r#"data-series="[0,2,1]""#), "{page}");
+    assert!(page.contains(r#"data-series="[0,42000,21000]""#));
+
+    for stats in [Value::Null, stats] {
+        let (_dir, base) = serve(stats).await;
+        let page = reqwest::get(format!("{base}/")).await.expect("home");
+        assert_eq!(page.status(), 200);
+        assert!(!page
+            .text()
+            .await
+            .expect("html")
+            .contains(r#"id="chart-tx""#));
+    }
+}
+
 /// What an indexer stores reaches a viewer and the home page through the
 /// database alone.
 #[tokio::test]

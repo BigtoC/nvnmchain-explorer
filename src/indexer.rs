@@ -1117,6 +1117,9 @@ async fn stats_loop(db: Db, interval: Duration, mut shutdown: watch::Receiver<bo
     }
 }
 
+/// Minutes of activity the home page charts.
+const CHART_MINUTES: usize = 60;
+
 fn compute_and_store_stats(db: &Db) -> Result<Value> {
     let conn = db::lock(db);
     let now = db::now_ts();
@@ -1197,6 +1200,24 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
         0.0
     };
 
+    // Transactions and gas in each minute of the last hour, oldest first.
+    // The hour ends at the newest block, so a lagging index still has data.
+    let mut tx_per_minute = vec![0_i64; CHART_MINUTES];
+    let mut gas_per_minute = vec![0_i64; CHART_MINUTES];
+    let mut minutes = conn.prepare(
+        "SELECT (timestamp - start - 1) / 60, SUM(tx_count), SUM(gas_used)
+         FROM blocks, (SELECT MAX(timestamp) - ?1 AS start FROM blocks)
+         WHERE timestamp > start GROUP BY 1",
+    )?;
+    let rows = minutes.query_map(params![60 * CHART_MINUTES as i64], |r| {
+        Ok((r.get::<_, usize>(0)?, r.get(1)?, r.get(2)?))
+    })?;
+    for row in rows {
+        let (minute, txs, gas) = row?;
+        tx_per_minute[minute] = txs;
+        gas_per_minute[minute] = gas;
+    }
+
     let stats = serde_json::json!({
         "latest_block": latest_block,
         "total_blocks": total_blocks,
@@ -1209,6 +1230,8 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
         "gas_util_pct": gas_util_pct,
         "chain_head": chain_head,
         "index_pct": index_pct,
+        "tx_per_minute": tx_per_minute,
+        "gas_per_minute": gas_per_minute,
         "updated_at": now,
     });
     // Still written to kv: it seeds the in-memory copy across a restart.
@@ -1220,6 +1243,39 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
 mod tests {
     use super::*;
     use crate::decoder::TRANSFER_TOPIC;
+
+    /// Each block counts in the minute it falls in, counted back from the newest.
+    #[test]
+    fn activity_is_charted_per_minute_back_from_the_newest_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stats.db");
+        let db: Db = Arc::new(Mutex::new(db::init_db(path.to_str().unwrap()).unwrap()));
+        let end = 1_700_000_000;
+        let blocks = [
+            (1, end - 3600, 9),
+            (2, end - 3599, 1),
+            (3, end - 61, 2),
+            (4, end - 30, 3),
+            (5, end, 4),
+        ];
+        for (number, timestamp, txs) in blocks {
+            db::lock(&db)
+                .execute(
+                    "INSERT INTO blocks (number, hash, parent_hash, timestamp, tx_count, gas_used)
+                     VALUES (?1, ?1, ?1, ?2, ?3, ?3 * 10)",
+                    params![number, timestamp, txs],
+                )
+                .unwrap();
+        }
+
+        let stats = compute_and_store_stats(&db).unwrap();
+        let txs: Vec<i64> = serde_json::from_value(stats["tx_per_minute"].clone()).unwrap();
+        assert_eq!(txs.len(), CHART_MINUTES);
+        // The block an hour before the newest is outside the hour.
+        assert_eq!((txs[0], txs[58], txs[59]), (1, 2, 7));
+        assert_eq!(txs.iter().sum::<i64>(), 10);
+        assert_eq!(stats["gas_per_minute"][59], 70);
+    }
 
     fn chunks(from: u64, to: u64, batch: u64) -> Vec<RangeInclusive<u64>> {
         block_chunks(from, to, batch).collect()
