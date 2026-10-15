@@ -35,7 +35,7 @@
 --   NULL::text): an untyped NULL column is text, which a bytea read rejects.
 -- * Bind every LIMIT/OFFSET as i64; get_anchoring_events passes a u32.
 -- * Token-name compares fold under "C": get_token_by_symbol_or_name's
---   lower(col) = lower($1) and search_tokens' `symbol = ?1 COLLATE NOCASE`decode_uint256_result.
+--   lower(col) = lower($1) and search_tokens' `symbol = ?1 COLLATE NOCASE`
 --   (PostgreSQL has no NOCASE) both become lower(col) = lower($1 COLLATE "C");
 --   a plain lower($1) folds under the database locale.
 -- * search_tokens' LIKE becomes ILIKE, run unprepared or with
