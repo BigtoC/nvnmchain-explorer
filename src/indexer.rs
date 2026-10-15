@@ -25,7 +25,7 @@ use crate::db::{self, Db};
 use crate::decoder::{checksum_address, decode_event, DecodedEvent};
 use crate::models::{AnchoringEvent, BlockBundle, Transaction, TransferEvent};
 use crate::parse::{parse_block, parse_transaction};
-use crate::rpc::ChainRpc;
+use crate::rpc::{ChainRpc, RpcError};
 use crate::summary::ZERO_ADDRESS;
 use crate::tokens::{fetch_token_metadata, has_control_chars};
 
@@ -146,6 +146,8 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
 
 /// Fetch `nums` in one HTTP request of `eth_getBlockByNumber`, then a second
 /// request of `eth_getBlockReceipts` only for blocks that have transactions.
+/// A range the node answers with one error, as reth does past its response size cap, is fetched
+/// in halves; a request that fails outright is not retried.
 async fn fetch_raw_blocks(
     rpc: &ChainRpc,
     nums: RangeInclusive<u64>,
@@ -162,7 +164,17 @@ async fn fetch_raw_blocks(
             )
         })
         .collect();
-    let results = rpc.batch_call(calls).await?;
+    let results = match rpc.batch_call(calls).await {
+        Err(e) if e.is::<RpcError>() && nums.start() < nums.end() => {
+            let (from, to) = nums.into_inner();
+            let mid = from + (to - from) / 2;
+            info!("blocks {from}..={to} refused ({e}); fetching in halves");
+            let mut blocks = Box::pin(fetch_raw_blocks(rpc, from..=mid)).await?;
+            blocks.extend(Box::pin(fetch_raw_blocks(rpc, mid + 1..=to)).await?);
+            return Ok(blocks);
+        }
+        results => results?,
+    };
 
     let mut blocks = Vec::with_capacity(results.len());
     let mut need_receipts = Vec::new();
@@ -253,7 +265,8 @@ fn without_missing_receipts(blocks: Vec<(Value, Option<Value>)>) -> Vec<(Value, 
         .collect()
 }
 
-async fn fetch_block_bundles(
+/// The bundles for `nums`; tokens in `known_tokens` are not described again.
+pub async fn fetch_block_bundles(
     rpc: &ChainRpc,
     known_tokens: Arc<Mutex<HashSet<String>>>,
     nums: RangeInclusive<u64>,
@@ -1275,6 +1288,57 @@ mod tests {
         assert_eq!((txs[0], txs[58], txs[59]), (1, 2, 7));
         assert_eq!(txs.iter().sum::<i64>(), 10);
         assert_eq!(stats["gas_per_minute"][59], 70);
+    }
+
+    #[tokio::test]
+    async fn a_refused_range_is_fetched_in_halves() {
+        use axum::{routing::post, Json, Router};
+
+        // Like reth past its response size cap: one error, not an array.
+        let handler = |Json(body): Json<Value>| async move {
+            let answer = |c: &Value| {
+                let block = json!({"number": c["params"][0], "transactions": []});
+                json!({"jsonrpc": "2.0", "id": c["id"], "result": block})
+            };
+            Json(match &body {
+                Value::Array(calls) if calls.len() > 2 => {
+                    json!({"jsonrpc": "2.0", "id": null, "error": {
+                        "code": -32011, "message": "The batch response was too large",
+                    }})
+                }
+                Value::Array(calls) => Value::Array(calls.iter().map(answer).collect()),
+                call => answer(call),
+            })
+        };
+        let rpc = ChainRpc::test_node(Router::new().route("/", post(handler))).await;
+
+        let blocks = fetch_raw_blocks(&rpc, 1..=7).await.unwrap();
+        let numbers: Vec<_> = blocks
+            .iter()
+            .map(|(b, _)| b["number"].as_str().unwrap())
+            .collect();
+        assert_eq!(numbers, ["0x1", "0x2", "0x3", "0x4", "0x5", "0x6", "0x7"]);
+    }
+
+    /// Halving a request the node did not answer would multiply the load on a node that is down.
+    #[tokio::test]
+    async fn a_failed_request_is_not_retried_in_halves() {
+        use axum::{http::StatusCode, routing::post, Router};
+        use std::sync::atomic::AtomicUsize;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        let handler = move || {
+            let counted = counted.clone();
+            async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                StatusCode::BAD_GATEWAY
+            }
+        };
+        let rpc = ChainRpc::test_node(Router::new().route("/", post(handler))).await;
+
+        assert!(fetch_raw_blocks(&rpc, 1..=7).await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     fn chunks(from: u64, to: u64, batch: u64) -> Vec<RangeInclusive<u64>> {
