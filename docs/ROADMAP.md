@@ -86,7 +86,7 @@ Users should notice a new UI and nothing else. Every item below has a task behin
 
 | Risk                                                                      | Mitigation                                                                                                                                                                                     | Task |
 |---------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------|
-| Health check tied to the UI: Fly probes `GET /`, which renders Tera today | `/healthz` (DB reachable, tip age) and the Fly check moved to it long before the cutover                                                                                                       | 4.1  |
+| Health check tied to the UI: Fly probes `GET /`, which renders Tera today | `/startupz` + `/livez` + `/readyz` (3.3), with the Fly and Render checks moved to them long before the cutover                                                                                                       | 3.3  |
 | Bookmarked or shared links break                                          | Every Tera path and query param (`page`, `tab`, `from`, `q`) has a matching SPA route, enforced by a test                                                                                      | 5.12 |
 | The wallet's `?format=json` calls break                                   | Legacy JSON layer, same paths and shape                                                                                                                                                        | 5.14 |
 | Tabs opened before the deploy still run the old Tera JS                   | `/api/events`, `/api/search`, `/api/anchoring/search` keep working as unversioned aliases                                                                                                      | 4.8  |
@@ -299,7 +299,7 @@ Needs only task 1.1 (`ReadMode` on `Db`), so it can run in parallel with the res
 
 ### 3.1 Honour `ROLE`
 - `WEB`: no indexer loops; DB opened `ReadOnly` (SQLite `read_only(true)`, PG `default_transaction_read_only = on`).
-- `INDEXER`: no HTTP server.
+- `INDEXER`: no app routes. It still listens on `PORT`, serving only the probe and health endpoints (3.3).
 - `ALL`: unchanged.
 - SSE works across processes, because the live feed already follows the database (`../tests/pages.rs` `the_live_feed_follows_the_database`).
 - Home stats work the same way. The indexer's `stats_loop` writes them to the `kv` table, and `web::feed` reads them from there.
@@ -310,6 +310,68 @@ Needs only task 1.1 (`ReadMode` on `Db`), so it can run in parallel with the res
 - Run indexer and web as separate processes or services.
 - **Fly.io constraint:** a Fly volume attaches to one machine, and each process group in `../fly.toml` runs on its own machines. With SQLite, Fly keeps `ROLE=ALL` on a single machine. Splitting `INDEXER` and `WEB` onto separate Fly machines requires the Postgres backend (Stage 2), either Fly Managed Postgres or an external one.
 - **Files:** `../fly.toml`, `render.yaml`, `deploy/entrypoint.sh`, `deploy/nvnmchain-explorer.service`, `deploy/install.sh`, `docker-compose.yml`, `README.md`
+
+### 3.3 Kubernetes probes: liveness, readiness, startup
+Following the [Kubernetes probe guide](https://kubernetes.io/docs/concepts/workloads/pods/probes/). Each probe answers one question, so each gets its own endpoint, kept apart from `/healthz` (4.1), which is a detailed report for people and monitoring:
+
+| Endpoint    | Question                   | 200 when                                                                                                                                                            | Never checks                          |
+|-------------|----------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------|
+| `/startupz` | Has it finished starting?  | Migrations are applied, the listener is up, and the boot RPC check has passed once: `eth_chainId` answered and matches `CHAIN_ID`. Sticky: once true it stays true. | the indexed tip                       |
+| `/livez`    | Is the process wedged?     | The runtime answers HTTP. For a role that runs the indexer: its loop has ticked within `INDEXER_STALL_SECONDS` (default 300).                                       | the DB, the RPC node, the indexed tip |
+| `/readyz`   | Should it get traffic now? | The DB answers a `SELECT 1` within ~1 s, the schema is at the latest migration the binary embeds, and shutdown has not started.                                     | the RPC node, the indexed tip         |
+
+- **Liveness only catches what a restart fixes.** The guide warns that a liveness probe tied to dependencies or load causes cascading restarts.
+  - A database or RPC outage must not restart pods. A database outage makes `/readyz` fail, and pods come back on their own once it recovers.
+  - The indexer heartbeat ticks on every loop iteration, including retries and backoff after RPC errors. So it fails only when the loop is truly stuck, not while the chain or the RPC node is slow.
+- **The RPC node is checked at startup, in all three roles.** It is the system's key dependency, so a pod that can't reach it, or reaches the wrong chain, should never start serving or indexing:
+  - At boot, every role calls `eth_chainId` and compares it with `CHAIN_ID`. It retries with backoff until it succeeds; `/startupz` turns 200 only after that, together with migrations. `WEB` makes the call too, even though it otherwise only touches the RPC node for a few pages.
+  - This catches a wrong `NVNM_RPC` URL, a missing or wrong `NVNM_RPC_API_KEY`, a node on the wrong network, or an RPC outage at deploy time. In a rolling update the new pods never pass startup, so the old pods keep serving and `kubectl rollout status` fails the deploy.
+  - It runs only until it passes. After startup, an RPC outage doesn't affect any probe: liveness or readiness tied to the shared RPC node would restart or unroute every pod at once without fixing anything, so it shows up in `/healthz` and alerting (4.1) instead.
+  - **Tradeoff:** during an RPC outage, a `WEB` pod that is rescheduled (node drain, scale-up, OOM) can't come back, although it could serve pages from the DB. Keep `WEB` at 2+ replicas with a `PodDisruptionBudget`, so a drain never takes them all at once.
+  - **No probe calls the RPC node itself.** Probes run every few seconds on every pod, and the RPC is rate-limited (#61). The boot task makes the call once per pod start (plus retries), and the probe reads its result. `ChainRpc` also records the time of its last successful response and its last error, for `/healthz`.
+- **A stale tip is not a probe failure.** If the indexer falls behind, every web pod sharing the database would go unready at once, taking the whole site down instead of serving slightly old data. Tip age stays in `/healthz` for alerting.
+- **Readiness and the schema:**
+  - `WEB` opens the DB read-only, so it can't run migrations. `INDEXER` (or `ALL`) runs them, and sqlx serialises concurrent migrators with an advisory lock on PG.
+  - `/readyz` compares `_sqlx_migrations` with the newest migration compiled into the binary. In a rolling deploy, new web pods stay out of rotation until the indexer has applied the new schema.
+- **Shutdown:** on SIGTERM, `/readyz` flips to 503 while the existing graceful shutdown drains connections and the indexer finishes its batch (`src/main.rs` waits up to 10 s). `terminationGracePeriodSeconds` must exceed that; the default 30 s does.
+- **Startup:** the HTTP listener binds first and serves only the probe routes until startup completes. The startup probe hits `/startupz`, which also implies everything `/livez` checks. Its `failureThreshold × periodSeconds` must cover the slowest start, including RPC retries: SQLite's 0001 can rebuild indexes on an old, large database, and a large PG migration can take minutes. Liveness and readiness don't run until it passes.
+- **Before Stage 1 lands,** a long block write blocks the single tokio worker, and `/livez` would time out mid-write. Probes go live after 1.6 / 1.7, or until then with a liveness `timeoutSeconds × failureThreshold` above the longest write.
+- **Per role:**
+  - `WEB`: startup (with the RPC check), liveness and readiness. Readiness gates the Service.
+  - `INDEXER`: startup (with the RPC check) and liveness. It gets no Service traffic, so readiness only matters as a signal. Run one replica, since the indexer is the only writer (`pg_advisory_xact_lock` from 2.6 guards against a second one).
+  - `ALL`: all three, startup with the RPC check.
+- Example container spec, documented in `README.md`. Thresholds are a starting point, to be tuned against measured start and write times:
+  ```yaml
+  startupProbe:
+    httpGet: { path: /startupz, port: 8080 }
+    periodSeconds: 10
+    failureThreshold: 60     # up to 10 min for migrations and RPC retries
+  livenessProbe:
+    httpGet: { path: /livez, port: 8080 }
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readinessProbe:
+    httpGet: { path: /readyz, port: 8080 }
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 2
+  ```
+- Fly and Render point their health checks at `/readyz`. Fly also gets a second check on `/livez`.
+- The probe routes sit outside `/api/v1`. They are not in the OpenAPI spec, and the SPA fallback (5.14) never shadows them.
+- **Tests (`tests/api.rs`):**
+  - `/livez` stays 200 with the DB gone.
+  - `/readyz` turns 503 with the DB gone, with the schema one migration behind, and after shutdown starts.
+  - A stuck indexer heartbeat fails `/livez`.
+  - In every role, `/startupz` stays 503 while the stub RPC node is down or reports a different chain id, and turns 200 once it answers with `CHAIN_ID`.
+  - After startup, a stub RPC node that stops answering leaves `/livez`, `/readyz` and `/startupz` at 200, and only `/healthz` reports it.
+- **Files:**
+  - new: `src/probes.rs` (routes, indexer heartbeat, schema check, boot RPC check)
+  - `src/rpc.rs` (record the last successful response and last error in `ChainRpc`)
+  - `src/main.rs` (probe-only listener for `INDEXER`, flip readiness on shutdown), `src/indexer.rs` (tick the heartbeat), `src/config.rs` (`INDEXER_STALL_SECONDS`, `RPC_STALE_SECONDS`), `src/web/mod.rs`
+  - `fly.toml`, `render.yaml`
+  - `README.md` (Kubernetes section with the probe spec), `.env.example`
+  - `tests/api.rs`
 
 ---
 
@@ -322,13 +384,12 @@ For each resource, pull the data-gathering logic out of the Tera page handler in
 - JSON error type: `{ "error": { "code", "message" } }` with proper status codes. 404s come back as JSON, not HTML.
 - `Page<T>` pagination DTO (`items`, `page`, `per_page`, `total`).
 - `utoipa` setup that serves `/api/v1/openapi.json`, with the `utoipa-scalar` UI at `/api/v1/docs`.
-- `GET /healthz`: 200 when the DB answers, and the indexed tip is no older than a threshold. Point the Fly and Render health checks at it, so the cutover no longer touches them.
+- `GET /healthz`: a JSON report for people and monitoring: role, DB reachable, schema version, indexed tip and its age, indexer heartbeat age, and the RPC node's state: last successful call, last error, and the chain head against the indexed tip (lag in blocks). It returns 503 when the DB is unreachable, the RPC has failed for longer than `RPC_STALE_SECONDS`, or the tip is older than a threshold, so alerting can fire on each. Probes and platform health checks use `/livez` and `/readyz` (3.3) instead, so a stale tip never takes the site down.
 - New `tests/api.rs`, added to the no-network test command in CI and AGENTS.md.
 - **Files:**
   - `../Cargo.toml` (`utoipa`, `utoipa-scalar` with the `axum` feature)
   - new: `src/api/mod.rs`, `src/api/error.rs`, `src/api/page.rs`, `src/api/health.rs`
   - `src/web/mod.rs` (nest the router), `../src/lib.rs`
-  - `../fly.toml` (`[[services.http_checks]] path = '/healthz'`), `render.yaml` (`healthCheckPath`)
   - `tests/api.rs` (new)
   - `../.github/workflows/ci.yml`, `AGENTS.md`, `Makefile`, `README.md` (API docs link)
 
@@ -511,15 +572,15 @@ Before Tera is deleted, every SPA page must render pixel-identical to the Tera p
   - every page and tab
   - SSE across a `fly machine restart`
   - wallet `?format=json` paths
-  - `/healthz`
-  - a deploy while a tab is open, checking that no chunk fails to load
+  - `/startupz`, `/livez`, `/readyz` and `/healthz`, and a pod or machine restart while the probes watch
+  - a deployment while a tab is open, checking that no chunk fails to load
 - Tear it down or keep it as a permanent staging app.
 - **Files:** `fly.staging.toml` (new), `../README.md` (staging + rollback runbook)
 
 ### 5.14 Cutover: serve the SPA at `/`
 - Turn on the `tower-http` `fs` feature.
 - Routing:
-  - `/api/*` and `/healthz` are unchanged.
+  - `/api/*`, `/healthz`, `/startupz`, `/livez` and `/readyz` are unchanged.
   - `/assets/*` is served from `STATIC_DIR` with `Cache-Control: public, max-age=31536000, immutable`. A missing asset is a 404, never the `index.html` fallback.
   - Every other path gets `index.html` with `Cache-Control: no-cache`.
 - **Legacy JSON layer:** on the old page paths, requests with `?format=json` or `Accept: application/json` still get the existing JSON contexts, frozen in shape. Everything else gets the SPA.
@@ -565,7 +626,7 @@ Before Tera is deleted, every SPA page must render pixel-identical to the Tera p
 2. Note the currently deployed image tag (`fly releases --image`) as the rollback target.
 3. Deploy that exact image: `fly deploy --image ghcr.io/<owner>/nvnmchain-explorer:sha-<commit>`.
 4. Smoke-test production:
-   - `/healthz`
+   - `/startupz`, `/readyz`, `/livez`, `/healthz`
    - home live feed
    - one tx, address and token page
    - one wallet `?format=json` path
@@ -584,7 +645,8 @@ Stage 0/1   0.1 ─┐
             0.3 ─────────────────┘
 Stage 2     1.8 ─► 2.1 ─► 2.2 ─► 2.3 ─► {2.4 2.5 2.6} ─► 2.7
                     └──► 2.8
-Stage 3     1.1 ─► 3.1 ─► 3.2          (separate machines/pods: also after 2.4–2.6)
+Stage 3     1.1 ─► 3.1 ─┬─► 3.2          (separate machines/pods: also after 2.4–2.6)
+                        └─► 3.3          (probes; live after 1.6 / 1.7)
 Stage 4     1.3 ─► 4.1 ─► {4.2 … 4.9}  (each also needs its own read port)
 Stage 5     5.1 ─► 5.2 ─► 5.3 ─► 5.4 ─► {5.5 … 5.11} ─► 5.12 ─► 5.13 ─► 5.14 + 5.15 (one release)
             (5.1 starts on day one; 5.2 needs 4.1; 5.4 is the pixel-parity gate; each page task needs its endpoint)
@@ -594,40 +656,41 @@ Stage 5     5.1 ─► 5.2 ─► 5.3 ─► 5.4 ─► {5.5 … 5.11} ─► 5.
 
 "Starts after" is the hard dependency. "In parallel with" lists the tasks that can be in progress at the same time.
 
-| Task          | Starts after                                                                                             | In parallel with                                 |
-|---------------|----------------------------------------------------------------------------------------------------------|--------------------------------------------------|
-| 0.1, 0.2, 0.3 | nothing (0.2: once no other PR touches `../src/web.rs`)                                                     | each other, 5.1                                  |
-| 5.1           | nothing: it only adds `frontend/` and a CI job                                                           | everything                                       |
-| 0.4           | 0.2                                                                                                      | 0.3, 1.1, 1.2                                    |
-| 1.1           | 0.2 (`AppState` lives in `src/web/mod.rs`). Land 0.1 first: 1.1 moves `../src/db.rs`                        | 0.3, 0.4                                         |
-| 1.2           | 1.1                                                                                                      | 0.4, 3.1                                         |
-| 1.3, 1.4, 1.5 | 1.2, 0.4 (handlers can `.await`), 0.3 (shared fixtures)                                                  | each other, 1.6, 1.7, 3.1, Stage 4 as it unlocks |
-| 1.6, 1.7      | 1.2                                                                                                      | each other, 1.3–1.5, 3.1                         |
-| 1.8           | 1.3–1.7                                                                                                  | 3.x, Stage 4, 5.x                                |
-| 2.1           | 1.8                                                                                                      | 3.x, Stage 4, 5.x                                |
-| 2.2 → 2.3     | 2.1, then 2.2                                                                                            | 2.8, 3.x, Stage 4, 5.x                           |
-| 2.4, 2.5, 2.6 | 2.3                                                                                                      | each other, 2.8, 3.x, Stage 4, 5.x               |
-| 2.7           | 2.4–2.6 (the dump needs the PG reads and write path)                                                     | 2.8, 3.x, Stage 4, 5.x                           |
-| 2.8           | 2.1 (`DB_URI` exists)                                                                                    | 2.2–2.7, 3.x, Stage 4, 5.x                       |
-| 3.1           | 1.1 (`ReadMode`)                                                                                         | the rest of Stages 1–2, Stage 4                  |
-| 3.2           | 3.1. Separate machines or pods also need 2.4–2.6                                                         | Stage 4, 5.x                                     |
-| 4.1           | 1.3 (`/healthz` reads the tip through the async `Db`)                                                    | 1.4–1.8, Stage 2, 3.x                            |
-| 4.2, 4.3, 4.4 | 4.1 (+ 1.3)                                                                                              | each other and the rest of Stage 4               |
-| 4.5, 4.6      | 4.1 + 1.4                                                                                                | each other and the rest of Stage 4               |
-| 4.7           | 4.1 + 1.5                                                                                                | the rest of Stage 4                              |
-| 4.8           | 4.1 + 1.3–1.5                                                                                            | the rest of Stage 4                              |
-| 4.9           | 4.1 (+ 1.3)                                                                                              | the rest of Stage 4                              |
-| 5.2           | 5.1, 4.1 (`/api/v1/openapi.json`)                                                                        | Stage 4                                          |
-| 5.3           | 5.2; `AddressLink` also needs 4.5 (`POST /api/v1/labels`)                                                | Stage 4                                          |
-| 5.4           | 5.3 (the shell is the first thing compared), 0.3 (fixture builders)                                      | Stage 4                                          |
-| 5.5           | 5.4 + 4.8 + 4.9                                                                                          | 5.6–5.11                                         |
-| 5.6           | 5.4 + 4.2                                                                                                | 5.5, 5.7–5.11                                    |
-| 5.7, 5.8      | 5.4 + 4.3, 5.4 + 4.4                                                                                     | the other page tasks                             |
-| 5.9, 5.10     | 5.4 + 4.5, 5.4 + 4.6                                                                                     | the other page tasks                             |
-| 5.11          | 5.4 + 4.7 + 4.8                                                                                          | the other page tasks                             |
-| 5.14, 5.15    | built once 4.1 and 4.8 exist; **merged** only after 5.13                                                 | 5.5–5.12 (developed, not merged)                 |
-| 5.12          | 5.5–5.11                                                                                                 | 5.14, 5.15 (on their branch)                     |
-| 5.13          | 5.12 and the 5.14 + 5.15 branch                                                                          | —                                                |
+| Task          | Starts after                                                                         | In parallel with                                 |
+|---------------|--------------------------------------------------------------------------------------|--------------------------------------------------|
+| 0.1, 0.2, 0.3 | nothing (0.2: once no other PR touches `../src/web.rs`)                              | each other, 5.1                                  |
+| 5.1           | nothing: it only adds `frontend/` and a CI job                                       | everything                                       |
+| 0.4           | 0.2                                                                                  | 0.3, 1.1, 1.2                                    |
+| 1.1           | 0.2 (`AppState` lives in `src/web/mod.rs`). Land 0.1 first: 1.1 moves `../src/db.rs` | 0.3, 0.4                                         |
+| 1.2           | 1.1                                                                                  | 0.4, 3.1                                         |
+| 1.3, 1.4, 1.5 | 1.2, 0.4 (handlers can `.await`), 0.3 (shared fixtures)                              | each other, 1.6, 1.7, 3.1, Stage 4 as it unlocks |
+| 1.6, 1.7      | 1.2                                                                                  | each other, 1.3–1.5, 3.1                         |
+| 1.8           | 1.3–1.7                                                                              | 3.x, Stage 4, 5.x                                |
+| 2.1           | 1.8                                                                                  | 3.x, Stage 4, 5.x                                |
+| 2.2 → 2.3     | 2.1, then 2.2                                                                        | 2.8, 3.x, Stage 4, 5.x                           |
+| 2.4, 2.5, 2.6 | 2.3                                                                                  | each other, 2.8, 3.x, Stage 4, 5.x               |
+| 2.7           | 2.4–2.6 (the dump needs the PG reads and write path)                                 | 2.8, 3.x, Stage 4, 5.x                           |
+| 2.8           | 2.1 (`DB_URI` exists)                                                                | 2.2–2.7, 3.x, Stage 4, 5.x                       |
+| 3.1           | 1.1 (`ReadMode`)                                                                     | the rest of Stages 1–2, Stage 4                  |
+| 3.2           | 3.1. Separate machines or pods also need 2.4–2.6                                     | Stage 4, 5.x                                     |
+| 3.3           | 3.1 (per-role behaviour), 1.2 (schema check). Turn on in k8s after 1.6 / 1.7         | 3.2, Stage 2, Stage 4, 5.x                       |
+| 4.1           | 1.3 (`/healthz` reads the tip through the async `Db`)                                | 1.4–1.8, Stage 2, 3.x                            |
+| 4.2, 4.3, 4.4 | 4.1 (+ 1.3)                                                                          | each other and the rest of Stage 4               |
+| 4.5, 4.6      | 4.1 + 1.4                                                                            | each other and the rest of Stage 4               |
+| 4.7           | 4.1 + 1.5                                                                            | the rest of Stage 4                              |
+| 4.8           | 4.1 + 1.3–1.5                                                                        | the rest of Stage 4                              |
+| 4.9           | 4.1 (+ 1.3)                                                                          | the rest of Stage 4                              |
+| 5.2           | 5.1, 4.1 (`/api/v1/openapi.json`)                                                    | Stage 4                                          |
+| 5.3           | 5.2; `AddressLink` also needs 4.5 (`POST /api/v1/labels`)                            | Stage 4                                          |
+| 5.4           | 5.3 (the shell is the first thing compared), 0.3 (fixture builders)                  | Stage 4                                          |
+| 5.5           | 5.4 + 4.8 + 4.9                                                                      | 5.6–5.11                                         |
+| 5.6           | 5.4 + 4.2                                                                            | 5.5, 5.7–5.11                                    |
+| 5.7, 5.8      | 5.4 + 4.3, 5.4 + 4.4                                                                 | the other page tasks                             |
+| 5.9, 5.10     | 5.4 + 4.5, 5.4 + 4.6                                                                 | the other page tasks                             |
+| 5.11          | 5.4 + 4.7 + 4.8                                                                      | the other page tasks                             |
+| 5.14, 5.15    | built once 4.1 and 4.8 exist; **merged** only after 5.13                             | 5.5–5.12 (developed, not merged)                 |
+| 5.12          | 5.5–5.11                                                                             | 5.14, 5.15 (on their branch)                     |
+| 5.13          | 5.12 and the 5.14 + 5.15 branch                                                      | —                                                |
 
 ### Waves
 
@@ -643,11 +706,11 @@ What can be in flight at once, as the work progresses:
 - 1.3 onward waits for 0.4, because a sync Tera closure cannot `.await` an async `Db`.
 - Stage 4 needs only the async reads each endpoint calls, not 1.8 and not Postgres, so Stages 2 and 4 run in parallel.
 - A Stage 5 page task needs only its matching Stage 4 endpoint, not the whole of Stage 4.
-- 4.1 (with `/healthz`) and 4.9 (SSE resume) ship well before the cutover, so both are already proven in production with Tera.
+- 3.3 (probes), 4.1 (`/healthz`) and 4.9 (SSE resume) ship well before the cutover, so they are already proven in production with Tera.
 - 5.13 runs the 5.14 + 5.15 branch on staging; those two then merge back to back and deploy as one release.
 - 3.1 before 1.8: `WEB` is fully read-only only once 1.8 removes the rusqlite handle. Until then that handle's `init_db` still runs its DDL and `seed_counters` on open.
 - **Same files, so parallel PRs need a rebase:**
   - 1.6 and 1.7 both edit `../src/indexer.rs` (different functions).
   - 2.1, 2.8 and 3.1 edit `../src/config.rs` and `src/main.rs`.
-  - 2.8, 3.2, 4.1 and 5.14 edit `../fly.toml` / `render.yaml`.
+  - 2.8, 3.2, 3.3 and 5.14 edit `../fly.toml` / `render.yaml`.
   - Each 4.x task registers its routes in `src/api/mod.rs`.
