@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use num_bigint::BigInt;
-use reqwest::Client;
+use reqwest::header::HeaderValue;
+use reqwest::{Client, RequestBuilder};
 use serde_json::{json, Value};
 
 use crate::config::Settings;
@@ -14,6 +15,10 @@ use crate::config::Settings;
 pub struct ChainRpc {
     client: Client,
     url: String,
+    /// `x-api-key` for JSON-RPC requests only. Set per request, not as a
+    /// client default, so [`ChainRpc::http_client`] never carries it to a
+    /// third party.
+    api_key: Option<HeaderValue>,
     req_id: AtomicU64,
 }
 
@@ -22,6 +27,7 @@ impl Clone for ChainRpc {
         Self {
             client: self.client.clone(),
             url: self.url.clone(),
+            api_key: self.api_key.clone(),
             req_id: AtomicU64::new(self.req_id.load(Ordering::Relaxed)),
         }
     }
@@ -51,12 +57,19 @@ impl ChainRpc {
         Ok(Self {
             client,
             url: url.into(),
+            api_key: None,
             req_id: AtomicU64::new(0),
         })
     }
 
     pub fn from_settings(settings: &Settings) -> Result<Self> {
-        Self::new(&settings.rpc_url)
+        Ok(Self::new(&settings.rpc_url)?.with_api_key(settings.rpc_api_key.clone()))
+    }
+
+    /// Send `key` as `x-api-key` on every JSON-RPC request.
+    pub fn with_api_key(mut self, key: Option<HeaderValue>) -> Self {
+        self.api_key = key;
+        self
     }
 
     /// The shared HTTP client, for the few requests that are not JSON-RPC —
@@ -64,6 +77,15 @@ impl ChainRpc {
     /// process rather than one per subsystem.
     pub fn http_client(&self) -> &Client {
         &self.client
+    }
+
+    /// A JSON-RPC POST to the node, with the API key when there is one.
+    fn post(&self) -> RequestBuilder {
+        let req = self.client.post(&self.url);
+        match &self.api_key {
+            Some(key) => req.header("x-api-key", key.clone()),
+            None => req,
+        }
     }
 
     fn next_id(&self) -> u64 {
@@ -78,8 +100,7 @@ impl ChainRpc {
             "params": params,
         });
         let resp = self
-            .client
-            .post(&self.url)
+            .post()
             .json(&payload)
             .send()
             .await
@@ -125,8 +146,7 @@ impl ChainRpc {
             })
             .collect();
         let resp = self
-            .client
-            .post(&self.url)
+            .post()
             .json(&payload)
             .send()
             .await
@@ -507,5 +527,77 @@ mod tests {
         assert_eq!(parse_int_any(&json!("")), 0);
         assert_eq!(parse_int_any(&json!("nonsense")), 0);
         assert_eq!(parse_int_any(&Value::Null), 0);
+    }
+
+    /// A node that answers every request with an empty JSON-RPC result and
+    /// records the `x-api-key` each request carried.
+    async fn key_recording_node() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    ) {
+        use axum::{http::HeaderMap, routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let handler = move |headers: HeaderMap, Json(body): Json<Value>| {
+            let key = headers
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            record.lock().unwrap_or_else(|e| e.into_inner()).push(key);
+            let answer =
+                |call: &Value| json!({"jsonrpc": "2.0", "id": call["id"], "result": "0x1"});
+            let reply = match &body {
+                Value::Array(calls) => Value::Array(calls.iter().map(answer).collect()),
+                call => answer(call),
+            };
+            async move { Json(reply) }
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, Router::new().route("/", post(handler))).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// The key goes on every JSON-RPC request, single and batched, and stays
+    /// off the shared client the signature directory borrows.
+    #[tokio::test]
+    async fn the_api_key_rides_on_rpc_requests_only() {
+        let (url, seen) = key_recording_node().await;
+        let rpc = ChainRpc::new(&url)
+            .expect("rpc")
+            .with_api_key(Some(HeaderValue::from_static("s3cret")));
+
+        rpc.call("eth_blockNumber", json!([])).await.expect("call");
+        rpc.batch_call(vec![("eth_chainId".into(), json!([]))])
+            .await
+            .expect("batch");
+        rpc.clone()
+            .call("eth_blockNumber", json!([]))
+            .await
+            .expect("clone");
+        rpc.http_client()
+            .post(&url)
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "x", "params": []}))
+            .send()
+            .await
+            .expect("plain");
+
+        let seen = seen.lock().unwrap().clone();
+        let key = Some("s3cret".to_string());
+        assert_eq!(seen, [key.clone(), key.clone(), key, None]);
+    }
+
+    #[tokio::test]
+    async fn no_api_key_sends_no_header() {
+        let (url, seen) = key_recording_node().await;
+        let rpc = ChainRpc::new(&url).expect("rpc");
+        rpc.call("eth_blockNumber", json!([])).await.expect("call");
+        assert_eq!(*seen.lock().unwrap(), [None]);
     }
 }
