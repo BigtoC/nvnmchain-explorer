@@ -675,13 +675,12 @@ Starts once the SPA is fully in production and Tera is deleted (5.15). After tha
 
 ```
 Stage 0/1   0.1 ─┐
-            0.2 ─┴─► 1.1 ─► 1.2 ─┐
-                                 ├─► {1.3 … 1.7} ─► 1.8
-            0.2 ─► 0.4 ──────────┤
+            0.2 ─┴─► 1.1 ─► 1.2 ─┬───────────────────► 1.6 ─┐
+            0.2 ─► 0.4 ──────────┼─► {1.3 1.4 1.5} ────────┴─► 1.7 (+ drop legacy handle) ─► 1.8 (cleanup)
             0.3 ─────────────────┘
-Stage 2     1.8 ─► 2.1 ─► 2.2 ─► 2.3 ─► {2.4 2.5 2.6} ─► 2.7
-                    └──► 2.8
-Stage 3     1.1 ─► 3.1 ─┬─► 3.2          (separate machines/pods: also after 2.4–2.6)
+Stage 2     1.1 ─► 2.1 ─► 2.2 ─► 2.3 ─► {2.4 2.5} ─► 2.6 ─► 2.7   (2.2 also needs 1.2; each of 2.4–2.6 also needs its SQLite port)
+                    └──► 2.8                              (PG runnable once 2.4–2.6 land and the legacy handle is gone; 1.8 not needed)
+Stage 3     1.1 ─► 3.1 ─┬─► 3.2          (separate machines/pods: also once PG is runnable)
                         └─► 3.3          (probes; live after 1.6 / 1.7)
 Stage 4     1.3 ─► 4.1 ─► {4.2 … 4.9}  (each also needs its own read port)
 Stage 5     5.1 ─► 5.2 ─► 5.3 ─► 5.4 ─► {5.5 … 5.11} ─► 5.12 ─► 5.13 ─► 5.14 + 5.15 (one release)
@@ -693,63 +692,66 @@ Stage 6     5.15 ─► {6.1 (optional) 6.2} ─► 6.3 (wallet repo) ─► 6.4
 
 "Starts after" is the hard dependency. "In parallel with" lists the tasks that can be in progress at the same time.
 
-| Task          | Starts after                                                                         | In parallel with                                 |
-|---------------|--------------------------------------------------------------------------------------|--------------------------------------------------|
-| 0.1, 0.2, 0.3 | nothing (0.2: once no other PR touches `../src/web.rs`)                              | each other, 5.1                                  |
-| 5.1           | nothing: it only adds `frontend/` and a CI job                                       | everything                                       |
-| 0.4           | 0.2                                                                                  | 0.3, 1.1, 1.2                                    |
-| 1.1           | 0.2 (`AppState` lives in `src/web/mod.rs`). Land 0.1 first: 1.1 moves `../src/db.rs` | 0.3, 0.4                                         |
-| 1.2           | 1.1                                                                                  | 0.4, 3.1                                         |
-| 1.3, 1.4, 1.5 | 1.2, 0.4 (handlers can `.await`), 0.3 (shared fixtures)                              | each other, 1.6, 1.7, 3.1, Stage 4 as it unlocks |
-| 1.6, 1.7      | 1.2                                                                                  | each other, 1.3–1.5, 3.1                         |
-| 1.8           | 1.3–1.7                                                                              | 3.x, Stage 4, 5.x                                |
-| 2.1           | 1.8                                                                                  | 3.x, Stage 4, 5.x                                |
-| 2.2 → 2.3     | 2.1, then 2.2                                                                        | 2.8, 3.x, Stage 4, 5.x                           |
-| 2.4, 2.5, 2.6 | 2.3                                                                                  | each other, 2.8, 3.x, Stage 4, 5.x               |
-| 2.7           | 2.4–2.6 (the dump needs the PG reads and write path)                                 | 2.8, 3.x, Stage 4, 5.x                           |
-| 2.8           | 2.1 (`DB_URI` exists)                                                                | 2.2–2.7, 3.x, Stage 4, 5.x                       |
-| 3.1           | 1.1 (`ReadMode`)                                                                     | the rest of Stages 1–2, Stage 4                  |
-| 3.2           | 3.1. Separate machines or pods also need 2.4–2.6                                     | Stage 4, 5.x                                     |
-| 3.3           | 3.1 (per-role behaviour), 1.2 (schema check). Turn on in k8s after 1.6 / 1.7         | 3.2, Stage 2, Stage 4, 5.x                       |
-| 4.1           | 1.3 (`/healthz` reads the tip through the async `Db`)                                | 1.4–1.8, Stage 2, 3.x                            |
-| 4.2, 4.3, 4.4 | 4.1 (+ 1.3)                                                                          | each other and the rest of Stage 4               |
-| 4.5, 4.6      | 4.1 + 1.4                                                                            | each other and the rest of Stage 4               |
-| 4.7           | 4.1 + 1.5                                                                            | the rest of Stage 4                              |
-| 4.8           | 4.1 + 1.3–1.5                                                                        | the rest of Stage 4                              |
-| 4.9           | 4.1 (+ 1.3)                                                                          | the rest of Stage 4                              |
-| 5.2           | 5.1, 4.1 (`/api/v1/openapi.json`)                                                    | Stage 4                                          |
-| 5.3           | 5.2; `AddressLink` also needs 4.5 (`POST /api/v1/labels`)                            | Stage 4                                          |
-| 5.4           | 5.3 (the shell is the first thing compared), 0.3 (fixture builders)                  | Stage 4                                          |
-| 5.5           | 5.4 + 4.8 + 4.9                                                                      | 5.6–5.11                                         |
-| 5.6           | 5.4 + 4.2                                                                            | 5.5, 5.7–5.11                                    |
-| 5.7, 5.8      | 5.4 + 4.3, 5.4 + 4.4                                                                 | the other page tasks                             |
-| 5.9, 5.10     | 5.4 + 4.5, 5.4 + 4.6                                                                 | the other page tasks                             |
-| 5.11          | 5.4 + 4.7 + 4.8                                                                      | the other page tasks                             |
-| 5.14, 5.15    | built once 4.1 and 4.8 exist; **merged** only after 5.13                             | 5.5–5.12 (developed, not merged)                 |
-| 5.12          | 5.5–5.11                                                                             | 5.14, 5.15 (on their branch)                     |
-| 5.13          | 5.12 and the 5.14 + 5.15 branch                                                      | —                                                |
-| 6.1, 6.2      | 5.15 (Tera is gone, the legacy layer is the last copy of the page code)              | each other                                       |
-| 6.3           | 6.2 (the path → endpoint mapping)                                                    | 6.1                                              |
-| 6.4           | 6.3, and legacy traffic at zero past the `Sunset` date                               | —                                                |
+| Task          | Starts after                                                                         | In parallel with                                          |
+|---------------|--------------------------------------------------------------------------------------|-----------------------------------------------------------|
+| 0.1, 0.2, 0.3 | nothing (0.2: once no other PR touches `../src/web.rs`)                              | each other, 5.1                                           |
+| 5.1           | nothing: it only adds `frontend/` and a CI job                                       | everything                                                |
+| 0.4           | 0.2                                                                                  | 0.3, 1.1, 1.2                                             |
+| 1.1           | 0.2 (`AppState` lives in `src/web/mod.rs`). Land 0.1 first: 1.1 moves `../src/db.rs` | 0.3, 0.4                                                  |
+| 1.2           | 1.1                                                                                  | 0.4, 3.1                                                  |
+| 1.3, 1.4, 1.5 | 1.2, 0.4 (handlers can `.await`), 0.3 (shared fixtures)                              | each other, 1.6, 1.7, Stage 2, 3.1, Stage 4 as it unlocks |
+| 1.6           | 1.2                                                                                  | 1.3–1.5, Stage 2, 3.1                                     |
+| 1.7           | 1.3–1.6 (reuses their methods); then drops the legacy handle                         | Stage 2, 3.1, Stage 4                                     |
+| 1.8           | 1.3–1.7 (cleanup; nothing waits on it, PG included)                                  | everything after it                                       |
+| 2.1           | 1.1 (`Db` enum)                                                                      | Stage 1, 3.x, Stage 4, 5.x                                |
+| 2.2 → 2.3     | 2.1 + 1.2 (migrations setup), then 2.2 + 0.3 (fixtures)                              | Stage 1, 2.8, 3.x, Stage 4, 5.x                           |
+| 2.4, 2.5      | 2.3 + their SQLite ports: 2.4 ← 1.3 + 1.5, 2.5 ← 1.4 + 1.5                           | each other, the rest of Stage 1, 2.8, 3.x, Stage 4, 5.x   |
+| 2.6           | 2.4 + 2.5 + 1.6 + 1.7                                                                | the rest of Stage 1, 2.8, 3.x, Stage 4, 5.x               |
+| 2.7           | 2.4–2.6 (the dump needs the PG reads and write path)                                 | 2.8, 3.x, Stage 4, 5.x                                    |
+| 2.8           | 2.1 (`DB_URI` exists)                                                                | 2.2–2.7, 3.x, Stage 4, 5.x                                |
+| 3.1           | 1.1 (`ReadMode`)                                                                     | the rest of Stages 1–2, Stage 4                           |
+| 3.2           | 3.1. Separate machines or pods also need PG runnable: 2.4–2.6 and the legacy handle gone (not 1.8)                | Stage 4, 5.x                                              |
+| 3.3           | 3.1 (per-role behaviour), 1.2 (schema check). Turn on in k8s after 1.6 / 1.7         | 3.2, Stage 2, Stage 4, 5.x                                |
+| 4.1           | 1.3 (`/healthz` reads the tip through the async `Db`)                                | 1.4–1.8, Stage 2, 3.x                                     |
+| 4.2, 4.3, 4.4 | 4.1 (+ 1.3)                                                                          | each other and the rest of Stage 4                        |
+| 4.5, 4.6      | 4.1 + 1.4                                                                            | each other and the rest of Stage 4                        |
+| 4.7           | 4.1 + 1.5                                                                            | the rest of Stage 4                                       |
+| 4.8           | 4.1 + 1.3–1.5                                                                        | the rest of Stage 4                                       |
+| 4.9           | 4.1 (+ 1.3)                                                                          | the rest of Stage 4                                       |
+| 5.2           | 5.1, 4.1 (`/api/v1/openapi.json`)                                                    | Stage 4                                                   |
+| 5.3           | 5.2; `AddressLink` also needs 4.5 (`POST /api/v1/labels`)                            | Stage 4                                                   |
+| 5.4           | 5.3 (the shell is the first thing compared), 0.3 (fixture builders)                  | Stage 4                                                   |
+| 5.5           | 5.4 + 4.8 + 4.9                                                                      | 5.6–5.11                                                  |
+| 5.6           | 5.4 + 4.2                                                                            | 5.5, 5.7–5.11                                             |
+| 5.7, 5.8      | 5.4 + 4.3, 5.4 + 4.4                                                                 | the other page tasks                                      |
+| 5.9, 5.10     | 5.4 + 4.5, 5.4 + 4.6                                                                 | the other page tasks                                      |
+| 5.11          | 5.4 + 4.7 + 4.8                                                                      | the other page tasks                                      |
+| 5.14, 5.15    | built once 4.1 and 4.8 exist; **merged** only after 5.13                             | 5.5–5.12 (developed, not merged)                          |
+| 5.12          | 5.5–5.11                                                                             | 5.14, 5.15 (on their branch)                              |
+| 5.13          | 5.12 and the 5.14 + 5.15 branch                                                      | —                                                         |
+| 6.1, 6.2      | 5.15 (Tera is gone, the legacy layer is the last copy of the page code)              | each other                                                |
+| 6.3           | 6.2 (the path → endpoint mapping)                                                    | 6.1                                                       |
+| 6.4           | 6.3, and legacy traffic at zero past the `Sunset` date                               | —                                                         |
 
 ### Waves
 
 What can be in flight at once, as the work progresses:
 1. **Start now:** 0.1, 0.2, 0.3, 5.1.
-2. **After 0.2:** 0.4 and 1.1 → 1.2. 3.1 starts as soon as 1.1 lands.
-3. **After 1.2, 0.3 and 0.4:** 1.3–1.7 all at once. Stage 4 starts when 1.3 lands (4.1 first), and each endpoint follows its read port. 5.2 → 5.3 → 5.4 start as soon as 4.1 lands, so the pixel-parity gate is in place before the first page.
-4. **After 1.8:** the Stage 2 chain, with 2.8 alongside it. Stages 4 and 5 keep going: SPA pages (5.5–5.11) land as their endpoints do, and the 5.14 + 5.15 branch is built next to them. 3.2 can split onto separate machines or pods once 2.4–2.6 land.
+2. **After 0.2:** 0.4 and 1.1 → 1.2. 3.1 and 2.1 start as soon as 1.1 lands; 2.2 → 2.3 follow once 1.2 and 0.3 are in.
+3. **After 1.2, 0.3 and 0.4:** 1.3–1.5 at once, with 1.6 (which needs only 1.2) alongside; then 1.7, which drops the legacy handle. Each is followed by its PG port as soon as it lands (2.4, 2.5, then 2.6). Stage 4 starts when 1.3 lands (4.1 first), and each endpoint follows its read port. 5.2 → 5.3 → 5.4 start as soon as 4.1 lands, so the pixel-parity gate is in place before the first page.
+4. **After 2.4–2.6 and the legacy handle drop:** PG is runnable, then 2.7, with 2.8 alongside. 1.8 cleans up whenever convenient; nothing waits on it. Stages 4 and 5 keep going: SPA pages (5.5–5.11) land as their endpoints do, and the 5.14 + 5.15 branch is built next to them. 3.2 can split onto separate machines or pods once PG is runnable (2.4–2.6 landed and the legacy handle dropped).
 5. **Finish:** 5.12 (full pixel-parity matrix passes) → 5.13 (staging) → 5.14 + 5.15 merged back to back and released.
 6. **After the cutover:** Stage 6 retires the legacy JSON layer. 6.4 waits on real traffic dropping to zero, so it runs on a calendar, not on other tasks.
 
 ### Notes
 - `{…}` groups are independent of each other and can be reviewed in parallel.
-- 1.3 onward waits for 0.4, because a sync Tera closure cannot `.await` an async `Db`.
+- 1.3–1.5 wait for 0.4, because a sync Tera closure cannot `.await` an async `Db`. 1.6 needs only 1.2. 1.7 comes last of 1.3–1.7 and drops the legacy handle.
 - Stage 4 needs only the async reads each endpoint calls, not 1.8 and not Postgres, so Stages 2 and 4 run in parallel.
+- Stage 2 runs alongside Stage 1: each PG port follows its SQLite port. PG becomes runnable once 2.4–2.6 have landed and the legacy handle is out of running code (end of 1.7), with 2.1 never opening SQLite in PG mode. 1.8 is cleanup and gates nothing.
 - A Stage 5 page task needs only its matching Stage 4 endpoint, not the whole of Stage 4.
 - 3.3 (probes), 4.1 (`/healthz`) and 4.9 (SSE resume) ship well before the cutover, so they are already proven in production with Tera.
 - 5.13 runs the 5.14 + 5.15 branch on staging; those two then merge back to back and deploy as one release.
-- 3.1 before 1.8: `WEB` is fully read-only only once 1.8 removes the rusqlite handle. Until then that handle's `init_db` still runs its DDL and `seed_counters` on open.
+- 3.1 during the port: `WEB` is fully read-only only once the legacy handle is dropped (end of 1.7). Until then that handle's `init_db` still runs its DDL and `seed_counters` on open.
 - **Same files, so parallel PRs need a rebase:**
   - 1.6 and 1.7 both edit `../src/indexer.rs` (different functions).
   - 2.1, 2.8 and 3.1 edit `../src/config.rs` and `src/main.rs`.
