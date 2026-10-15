@@ -286,13 +286,3 @@ CREATE TABLE IF NOT EXISTS genesis_balances (
     balance TEXT NOT NULL,
     PRIMARY KEY (token_addr, holder_addr)
 );
-
--- Function signatures for selectors no built-in ABI declares, as answered
--- by the configured directory. An empty `signature` is a remembered miss:
--- the directory did not know it either, and asking again on every page view
--- would be a request per view forever.
-CREATE TABLE IF NOT EXISTS selector_names (
-    selector TEXT PRIMARY KEY,
-    signature TEXT NOT NULL DEFAULT '',
-    fetched_at BIGINT NOT NULL DEFAULT 0
-);
