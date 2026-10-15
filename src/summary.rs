@@ -23,7 +23,7 @@ use crate::tempo_address::is_virtual;
 use crate::tokens::format_token_amount;
 
 /// `0x1234…5678` — long enough to recognise, short enough to read in a line.
-fn truncate(value: &str) -> String {
+pub(crate) fn truncate(value: &str) -> String {
     truncate_hash(value, 4, 4)
 }
 
@@ -721,6 +721,12 @@ static PHRASES: &[Phrase] = &[
         &[Slot::Word("to"), Slot::Account("newOwner")],
     ),
     phrase(
+        "Upgraded(address)",
+        "upgraded",
+        "Upgrade",
+        &[Slot::Word("to"), Slot::Account("implementation")],
+    ),
+    phrase(
         "Initialized(uint64)",
         "initialized",
         "Initialize",
@@ -1059,6 +1065,8 @@ pub struct KnownEvent {
     pub details: Vec<(String, String)>,
     pub from: Option<String>,
     pub to: Option<String>,
+    /// The addresses the headline shows truncated, in its order, for a page to link.
+    pub accounts: Vec<String>,
     /// A TIP-20 transfer into the fee manager — the fee, not the payment.
     pub is_fee: bool,
     /// Position in the receipt's log list, so the UI can pair the two.
@@ -1152,6 +1160,14 @@ fn known_event(
             .collect(),
         from: event.param("from").map(String::from),
         to: event.param("to").map(String::from),
+        accounts: definition
+            .slots
+            .iter()
+            .filter_map(|slot| match slot {
+                Slot::Account(name) => event.param(name).map(String::from),
+                _ => None,
+            })
+            .collect(),
         is_fee: false,
         log_index,
     };
@@ -1279,6 +1295,8 @@ pub struct TxSummary {
     /// `success`, `failure`, or `neutral` — what the card is coloured by.
     pub tone: String,
     pub headline: String,
+    /// As [`KnownEvent::accounts`], for the headline.
+    pub accounts: Vec<String>,
     pub details: Vec<String>,
     /// The failure in words, when there was one.
     pub error: Option<String>,
@@ -1321,6 +1339,7 @@ pub fn build_summary(
         return TxSummary {
             tone: "success".into(),
             headline: "Transaction succeeded.".into(),
+            accounts: Vec::new(),
             details: vec!["No high-level events were detected for this transaction.".into()],
             error: None,
             raw_reason: None,
@@ -1331,6 +1350,7 @@ pub fn build_summary(
     TxSummary {
         tone: "success".into(),
         headline: format!("{}.", event.headline),
+        accounts: event.accounts.clone(),
         details: vec![format!(
             "{interpreted} interpreted event{} detected.",
             if interpreted == 1 { "" } else { "s" }
@@ -1403,6 +1423,7 @@ fn failure_summary(failure: &Failure, events: &[KnownEvent], tokens: &Tokens) ->
     TxSummary {
         tone: "failure".into(),
         headline: format!("{action}."),
+        accounts: Vec::new(),
         details,
         error,
         raw_reason,
@@ -1473,6 +1494,7 @@ fn insufficient_balance_summary(
     Some(TxSummary {
         tone: "failure".into(),
         headline: format!("Transfer failed: insufficient {label}.{amounts}"),
+        accounts: Vec::new(),
         details,
         error: Some(format!("insufficient {label}")),
         raw_reason: raw_reason.map(String::from),
@@ -1563,6 +1585,23 @@ mod tests {
     fn say(log: &serde_json::Value, sender: Option<&str>) -> KnownEvent {
         let decoded = decode_event(log).expect("decoded");
         known_event(&decoded, 0, &token_map(), sender).expect("phrased")
+    }
+
+    /// An upgrade names the implementation, and keeps it whole for a page to link.
+    #[test]
+    fn an_upgrade_names_its_implementation() {
+        let implementation = "0x63Ff0c732C26951034baD4e4EbD163a9eec5a927";
+        let event = say(
+            &json!({
+                "address": "0x0000000000000000000000000000000000000a00",
+                "topics": [keccak_hex(b"Upgraded(address)"), topic(implementation)],
+                "data": "0x",
+                "logIndex": "0x0",
+            }),
+            None,
+        );
+        assert_eq!(event.headline, "Upgrade to 0x63Ff…a927");
+        assert_eq!(event.accounts, [implementation]);
     }
 
     /// The headline sentence the whole feature exists for.

@@ -79,6 +79,9 @@
 </span>
 {% endmacro copy_address %}
 
+{# A decoded argument's value: an address as `copy_address` shows one, anything else as text. #}
+{% macro param_value(param) %}{% if param.type == "address" %}{{ self::copy_address(address=param.value, full=true) }}{% else %}{{ param.value }}{% endif %}{% endmacro param_value %}
+
 {# A transaction hash: linked, truncated, and copyable. #}
 {% macro copy_tx(hash) %}
 <span class="addr">

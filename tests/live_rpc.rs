@@ -40,7 +40,7 @@ static CHAIN: LazyLock<Settings> = LazyLock::new(|| {
     chain
 });
 
-/// One client, cloned per test, so every test shares the testnet's pace.
+/// One pace for every test, since they share the testnet's limit.
 static RPC: LazyLock<ChainRpc> = LazyLock::new(|| {
     let rpc = ChainRpc::from_settings(&CHAIN).expect("rpc client");
     if CHAIN.rpc_url == TESTNET_RPC {
@@ -50,8 +50,10 @@ static RPC: LazyLock<ChainRpc> = LazyLock::new(|| {
     }
 });
 
+/// A copy of `RPC` on the test's own connections: they die with the runtime
+/// that opened them, and each test has its own.
 fn rpc() -> ChainRpc {
-    RPC.clone()
+    RPC.with_own_connections().expect("rpc client")
 }
 
 /// A recent block that has transactions, and their hashes in block order.

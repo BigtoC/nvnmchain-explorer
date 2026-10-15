@@ -964,6 +964,54 @@ async fn addresses_are_copyable_and_labelled() {
     assert!(body.contains(">pathUSD<"), "the token is named");
 }
 
+/// A sentence's accounts and an address argument both link to the address.
+#[tokio::test]
+async fn the_addresses_in_sentences_and_arguments_are_links() {
+    let (_dir, base) = serve(Value::Null).await;
+    let body = reqwest::get(format!("{base}/tx/{TX_HASH}"))
+        .await
+        .expect("tx page")
+        .text()
+        .await
+        .expect("body");
+    let to = "0x2222222222222222222222222222222222222222";
+    let link = format!(r#"<a href="/address/{to}" class="text-blue-400 hover:text-blue-300">"#);
+    assert!(
+        body.contains(&format!("{link}0x2222…2222</a>")),
+        "the sentence links its recipient"
+    );
+    // `copy_address`'s own link, whose href Tera escapes.
+    assert!(
+        body.contains(&format!("hover:text-blue-300\">{to}</a>")),
+        "so does the argument"
+    );
+}
+
+/// A sentence is escaped before its accounts are linked, and an address it shows twice gets two
+/// links, not one inside the other.
+#[test]
+fn a_sentence_is_escaped_then_linked() {
+    let (_dir, db) = temp_db("link.db");
+    let mut tera = (*nvnmchain_explorer::web::build_tera(db).expect("tera")).clone();
+    let to = "0x2222222222222222222222222222222222222222";
+    let mut context = tera::Context::new();
+    context.insert("headline", "<b>Move</b> 0x2222…2222 to 0x2222…2222");
+    context.insert("accounts", &[to, to]);
+    let html = tera
+        .render_str(
+            "{{ headline | link_accounts(accounts=accounts) | safe }}",
+            &context,
+        )
+        .expect("render");
+    let link = format!(
+        r#"<a href="/address/{to}" class="text-blue-400 hover:text-blue-300">0x2222…2222</a>"#
+    );
+    assert_eq!(
+        html,
+        format!("&lt;b&gt;Move&lt;&#x2F;b&gt; {link} to {link}")
+    );
+}
+
 /// A precompile is named by the built-in table rather than by the database.
 #[tokio::test]
 async fn precompiles_are_labelled_without_a_database_row() {
@@ -1348,4 +1396,25 @@ async fn the_zone_contracts_are_named_with_their_interfaces() {
 
     let page = get_json(&base, &format!("/address/{portal}?tab=contract")).await;
     assert_eq!(page["interface"]["abis"], json!(["zone_portal"]));
+}
+
+/// The anchoring contract's interface has an owner.
+#[tokio::test]
+async fn the_anchoring_interface_has_an_owner() {
+    let (_dir, base) = serve(Value::Null).await;
+    let page = get_json(
+        &base,
+        "/address/0x0000000000000000000000000000000000000a00?tab=contract",
+    )
+    .await;
+    let named = |kind: &str, name: &str| {
+        page["interface"][kind]
+            .as_array()
+            .expect(kind)
+            .iter()
+            .any(|f| f["name"] == json!(name))
+    };
+    assert!(named("reads", "owner"));
+    assert!(named("writes", "transferOwnership"));
+    assert!(named("events", "OwnershipTransferred"));
 }

@@ -128,6 +128,16 @@ impl ChainRpc {
         self
     }
 
+    /// This client on connections of its own, pace and key kept. A connection
+    /// dies with the tokio runtime that opened it, so a client used from several
+    /// runtimes, one per `#[tokio::test]`, needs a copy for each.
+    pub fn with_own_connections(&self) -> Result<Self> {
+        Ok(Self {
+            client: Self::new(&self.url)?.client,
+            ..self.clone()
+        })
+    }
+
     pub fn from_settings(settings: &Settings) -> Result<Self> {
         Ok(Self::new(&settings.rpc_url)?.with_api_key(settings.rpc_api_key.clone()))
     }
@@ -693,7 +703,8 @@ mod tests {
             .await
             .paced(Duration::from_millis(300));
         let started = Instant::now();
-        for _ in 0..2 {
+        // The second batch goes through a copy, which keeps the pace.
+        for rpc in [rpc.clone(), rpc.with_own_connections().unwrap()] {
             let results = rpc
                 .batch_call(vec![
                     ("eth_chainId".into(), json!([])),

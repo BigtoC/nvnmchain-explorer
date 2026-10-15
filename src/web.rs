@@ -38,7 +38,7 @@ use crate::decoder::{
 use crate::name_search;
 use crate::rpc::ChainRpc;
 use crate::signatures;
-use crate::summary::{build_summary, known_events, Failure, TokenDisplay, Tokens};
+use crate::summary::{build_summary, known_events, truncate, Failure, TokenDisplay, Tokens};
 use crate::tempo_address::parse_virtual;
 use crate::tokens::{
     fetch_token_metadata, format_token_amount, format_token_amount_with_symbol, has_control_chars,
@@ -2283,6 +2283,28 @@ pub fn build_tera(db: Db) -> Result<Arc<Tera>> {
         })
     });
 
+    // A sentence escaped, then each of its `accounts`, in order, linked where it shows truncated.
+    tera.register_filter(
+        "link_accounts",
+        |value: &Value, args: &HashMap<String, Value>| {
+            let escaped = tera::escape_html(value.as_str().unwrap_or(""));
+            let accounts = args.get("accounts").and_then(Value::as_array);
+            let (mut html, mut rest) = (String::new(), escaped.as_str());
+            for account in accounts.into_iter().flatten().filter_map(Value::as_str) {
+                let (full, short) = (checksum_address(account), truncate(account));
+                let Some(at) = rest.find(&short).filter(|_| is_valid_address(&full)) else {
+                    continue;
+                };
+                html.push_str(&rest[..at]);
+                html.push_str(&format!(
+                    r#"<a href="/address/{full}" class="text-blue-400 hover:text-blue-300">{short}</a>"#
+                ));
+                rest = &rest[at + short.len()..];
+            }
+            html.push_str(rest);
+            Ok(Value::String(html))
+        },
+    );
     tera.register_function("truncate_hash", |args: &HashMap<String, Value>| {
         let h = args.get("h").and_then(Value::as_str).unwrap_or("");
         let prefix = args.get("prefix").and_then(Value::as_i64).unwrap_or(8) as usize;

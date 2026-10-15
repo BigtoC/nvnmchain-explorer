@@ -84,7 +84,7 @@ async fn word(rpc: &ChainRpc, slot: B256) -> Result<U256> {
     word.parse().with_context(|| format!("storage word {word}"))
 }
 
-/// `_registryCount`, above `_moduleAdmin` in slot 3. Ids run `1..=count`.
+/// `_registryCount`, above `_formerAdmin` in slot 3. Ids run `1..=count`.
 async fn registry_count(rpc: &ChainRpc) -> Result<u64> {
     let slot = word(rpc, B256::with_last_byte(3)).await?;
     Ok((slot >> 160usize).saturating_to())
