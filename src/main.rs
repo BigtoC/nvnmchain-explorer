@@ -98,6 +98,14 @@ async fn main() -> anyhow::Result<()> {
         });
     });
 
+    // The indexer's window to flush starts at the signal, beside the connections'.
+    let mut stopping = shutdown_rx.clone();
+    let indexer_stopped = tokio::spawn(async move {
+        if stopping.wait_for(|&stop| stop).await.is_ok() {
+            let _ = tokio::time::timeout(Duration::from_secs(10), indexer_task).await;
+        }
+    });
+
     tokio::select! {
         r = server => r.context("server error")?,
         // Backstop: graceful shutdown waits on in-flight connections, and a
@@ -107,10 +115,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // The indexer loops exit on the shutdown signal; give them a bounded
-    // window to flush in-flight work, then exit regardless.
     info!("server stopped; waiting for indexer shutdown");
-    let _ = tokio::time::timeout(Duration::from_secs(10), indexer_task).await;
+    let _ = indexer_stopped.await;
     info!("shutdown complete");
     Ok(())
 }
