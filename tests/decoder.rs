@@ -431,7 +431,7 @@ fn balance_changes_from_receipt() {
     assert_eq!(changes[1]["change"], "+500");
     assert_eq!(changes[0]["is_fee"], false);
 
-    let calls = extract_calls(&tx, &[]);
+    let calls = extract_calls(&tx, &Default::default(), &[]);
     assert!(calls.is_empty());
 }
 

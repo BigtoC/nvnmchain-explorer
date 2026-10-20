@@ -917,11 +917,9 @@ fn walk_trace(node: &Value, depth: usize, result: &mut Vec<Value>) {
     let children = node
         .get("calls")
         .or_else(|| node.get("children"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        .and_then(Value::as_array);
     let mut child_indices = Vec::new();
-    for child in &children {
+    for child in children.into_iter().flatten() {
         child_indices.push(result.len());
         walk_trace(child, depth + 1, result);
     }
@@ -954,12 +952,8 @@ pub const FEE_MANAGER_ADDRESS: &str = "0xfeEC00000000000000000000000000000000000
 
 pub fn extract_balance_changes(receipt: &Value, tx: &Transaction) -> Vec<Value> {
     let mut changes = Vec::new();
-    let logs = receipt
-        .get("logs")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for log in &logs {
+    let logs = receipt.get("logs").and_then(Value::as_array);
+    for log in logs.into_iter().flatten() {
         if let Some(decoded) = decode_event(log) {
             if decoded.name.as_deref() == Some("Transfer") {
                 // Checksummed: the token metadata this is rendered with is
@@ -986,18 +980,13 @@ pub fn extract_balance_changes(receipt: &Value, tx: &Transaction) -> Vec<Value> 
     if let Some(fee_token) = tx.fee_token.as_deref() {
         let fee_ok = tx.fee_amount.parse::<i64>().map(|n| n > 0).unwrap_or(false);
         if fee_ok {
+            let is = |c: &Value, key: &str, want: &str| {
+                c.get(key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|got| got.eq_ignore_ascii_case(want))
+            };
             for c in changes.iter_mut() {
-                let addr = c
-                    .get("address")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_lowercase();
-                let token = c
-                    .get("token")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_lowercase();
-                if addr == FEE_MANAGER_ADDRESS.to_lowercase() && token == fee_token.to_lowercase() {
+                if is(c, "address", FEE_MANAGER_ADDRESS) && is(c, "token", fee_token) {
                     c["is_fee"] = json!(true);
                     c["change_type"] = json!("fee");
                 }
@@ -1007,27 +996,13 @@ pub fn extract_balance_changes(receipt: &Value, tx: &Transaction) -> Vec<Value> 
     changes
 }
 
-/// Extract internal calls: use the flattened trace when available, otherwise
-/// fall back to the top-level `calls` field of the raw transaction.
-pub fn extract_calls(tx: &Transaction, trace: &[Value]) -> Vec<Value> {
+/// The calls to show: the flattened trace when there is one, else the raw
+/// transaction's top-level calls, decoded.
+pub fn extract_calls(tx: &Transaction, parsed: &ParsedTx, trace: &[Value]) -> Vec<Value> {
     if !trace.is_empty() {
-        let mut out = trace.to_vec();
-        for call in out.iter_mut() {
-            if call.get("input").is_some() && call.get("data").is_none() {
-                call["data"] = call["input"].clone();
-            }
-        }
-        return out;
+        return trace.to_vec();
     }
-
-    // Tempo-style txs carry their calls in the raw RLP object; parse it with
-    // the official tempo primitives.
-    let mut calls = tx
-        .raw
-        .as_deref()
-        .map(parse_raw_tx)
-        .unwrap_or_default()
-        .calls;
+    let mut calls = parsed.calls.clone();
     for call in calls.iter_mut() {
         call["from"] = json!(tx.from_addr);
         let data = call.get("data").and_then(Value::as_str).unwrap_or("0x");

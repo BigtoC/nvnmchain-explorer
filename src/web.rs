@@ -33,7 +33,7 @@ use crate::db::{self, Db, TxColumns};
 use crate::decoder::{
     checksum_address, decode_event, decode_function_call, decode_revert, decode_with_signature,
     event_signature, extract_balance_changes, extract_calls, flatten_trace, function_signature,
-    keccak_hex, revert_data_in, DecodedEvent, REGISTRY,
+    keccak_hex, revert_data_in, DecodedEvent, ParsedTx, REGISTRY,
 };
 use crate::name_search;
 use crate::rpc::ChainRpc;
@@ -79,21 +79,12 @@ fn columns_for(headers: &HeaderMap, query: &HashMap<String, String>) -> TxColumn
     }
 }
 
-fn render_html(tera: &Tera, template: &str, ctx: &Value) -> Response {
-    match tera::Context::from_serialize(ctx) {
-        Ok(tera_ctx) => match tera.render(template, &tera_ctx) {
-            Ok(html) => Html(html).into_response(),
-            Err(e) => {
-                tracing::error!("template {template} render failed: {e:?}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Html("Internal server error"),
-                )
-                    .into_response()
-            }
-        },
+fn render_html(tera: &Tera, template: &str, ctx: Value) -> Response {
+    let rendered = tera::Context::from_value(ctx).and_then(|ctx| tera.render(template, &ctx));
+    match rendered {
+        Ok(html) => Html(html).into_response(),
         Err(e) => {
-            tracing::error!("template context serialization failed: {e}");
+            tracing::error!("template {template} render failed: {e:?}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Html("Internal server error"),
@@ -103,19 +94,15 @@ fn render_html(tera: &Tera, template: &str, ctx: &Value) -> Response {
     }
 }
 
-fn json_response(ctx: &Value) -> Response {
-    Json(ctx.clone()).into_response()
-}
-
 fn html_or_json(
     state: &AppState,
     headers: &HeaderMap,
     query: &HashMap<String, String>,
     template: &str,
-    ctx: &Value,
+    ctx: Value,
 ) -> Response {
     if wants_json(headers, query) {
-        json_response(ctx)
+        Json(ctx).into_response()
     } else {
         render_html(&state.tera, template, ctx)
     }
@@ -199,18 +186,14 @@ fn tx_method_badge(input: &str) -> Option<String> {
 /// and the raw RPC object: (fee payer, signature type, failure reason).
 pub fn tx_extras(
     tx: &crate::models::Transaction,
+    parsed: &ParsedTx,
     receipt: Option<&Value>,
 ) -> (Option<String>, Option<String>, Option<String>) {
     let fee_payer = receipt
         .and_then(|r| r.get("feePayer").and_then(Value::as_str))
         .filter(|s| !s.is_empty())
         .map(String::from);
-    let signature_type = tx
-        .raw
-        .as_deref()
-        .map(crate::decoder::parse_raw_tx)
-        .unwrap_or_default()
-        .sig_type;
+    let signature_type = parsed.sig_type.clone();
     let fail_reason = if tx.status == 0 {
         receipt
             .and_then(|r| {
@@ -234,20 +217,16 @@ pub fn tx_extras(
 pub async fn replay_tx_calls(
     rpc: &ChainRpc,
     tx: &crate::models::Transaction,
+    parsed: &ParsedTx,
 ) -> Vec<Option<String>> {
-    let parsed = tx
-        .raw
-        .as_deref()
-        .map(crate::decoder::parse_raw_tx)
-        .unwrap_or_default();
-    let calls = parsed.calls;
-    if calls.is_empty() {
+    if parsed.calls.is_empty() {
         return Vec::new();
     }
     let from = tx.from_addr.clone();
     let gas = format!("0x{:x}", parsed.gas_limit.unwrap_or(0).max(0));
     let block = format!("0x{:x}", tx.block_number.max(0));
-    let batch: Vec<(String, Value)> = calls
+    let batch: Vec<(String, Value)> = parsed
+        .calls
         .iter()
         .filter_map(|call| {
             let to = call.get("to").and_then(Value::as_str)?;
@@ -294,22 +273,32 @@ fn tokens_mentioned(event: &DecodedEvent) -> Vec<String> {
         .collect()
 }
 
-/// Symbol and decimals per address, keyed lowercase: a log and the database
-/// need not agree on checksum casing.
-fn token_display_map(state: &AppState, addresses: impl Iterator<Item = String>) -> Tokens {
+/// Metadata for every token among `addresses`, however they are spelled, in
+/// one query. Keyed by the stored (checksummed) address.
+fn token_metas(
+    db: &Db,
+    addresses: impl IntoIterator<Item = String>,
+) -> HashMap<String, crate::models::TokenMetadata> {
     let mut wanted: Vec<String> = addresses
+        .into_iter()
         .map(|a| checksum_address(&a))
         .filter(|a| is_valid_address(a))
         .collect();
     wanted.sort();
     wanted.dedup();
-    db::get_tokens_metadata(&state.db, &wanted)
-        .into_iter()
+    db::get_tokens_metadata(db, &wanted)
+}
+
+/// Symbol and decimals per address, keyed lowercase: a log and the database
+/// need not agree on checksum casing.
+fn token_display_map(metas: &HashMap<String, crate::models::TokenMetadata>) -> Tokens {
+    metas
+        .iter()
         .map(|(address, meta)| {
             (
                 address.to_lowercase(),
                 TokenDisplay {
-                    symbol: meta.symbol,
+                    symbol: meta.symbol.clone(),
                     decimals: meta.decimals,
                 },
             )
@@ -712,7 +701,7 @@ pub async fn home(
             "index_pct_display": format!("{index_pct:.1}"),
         }),
     );
-    html_or_json(&state, &headers, &query, "home.html", &ctx)
+    html_or_json(&state, &headers, &query, "home.html", ctx)
 }
 
 /// How often [`feed`] polls the database.
@@ -947,7 +936,7 @@ pub async fn block_page(
             "next_block": neighbour(block.number + 1),
         }),
     );
-    html_or_json(&state, &headers, &query, "block.html", &ctx)
+    html_or_json(&state, &headers, &query, "block.html", ctx)
 }
 
 pub async fn blocks_page(
@@ -987,7 +976,7 @@ pub async fn blocks_page(
             "last_num": blocks.last().and_then(|b| b.get("number")).and_then(Value::as_i64),
         }),
     );
-    html_or_json(&state, &headers, &query, "blocks.html", &ctx)
+    html_or_json(&state, &headers, &query, "blocks.html", ctx)
 }
 
 /// Every transaction the indexer holds, newest first: what the home page's feed
@@ -1024,7 +1013,7 @@ pub async fn txs_page(
             "total_pages": total_pages(total, PER_PAGE),
         }),
     );
-    html_or_json(&state, &headers, &query, "txs.html", &ctx)
+    html_or_json(&state, &headers, &query, "txs.html", ctx)
 }
 
 /// Tripped when the node turns out to have no `debug_` namespace. Indexing
@@ -1055,7 +1044,7 @@ fn is_method_unsupported(err: &anyhow::Error) -> bool {
 
 /// Traces already fetched, by transaction hash: nothing stores them, so this
 /// is what keeps every view from tracing the transaction again.
-static TRACES: LazyLock<Mutex<HashMap<String, Vec<Value>>>> = LazyLock::new(Default::default);
+static TRACES: LazyLock<Mutex<HashMap<String, Arc<Vec<Value>>>>> = LazyLock::new(Default::default);
 
 /// Traces held before the cache starts over.
 const MAX_TRACES: usize = 256;
@@ -1064,7 +1053,7 @@ const MAX_TRACES: usize = 256;
 async fn fetch_missing_trace(
     state: &AppState,
     tx: &crate::models::Transaction,
-) -> Option<Vec<Value>> {
+) -> Option<Arc<Vec<Value>>> {
     let cached = TRACES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1097,11 +1086,12 @@ async fn fetch_missing_trace(
     if flat.is_empty() {
         return None;
     }
+    let flat = Arc::new(flat);
     let mut held = TRACES.lock().unwrap_or_else(|e| e.into_inner());
     if held.len() >= MAX_TRACES {
         held.clear();
     }
-    held.insert(tx.hash.clone(), flat.clone());
+    held.insert(tx.hash.clone(), Arc::clone(&flat));
     Some(flat)
 }
 
@@ -1126,15 +1116,10 @@ fn top_level_call(tx: &crate::models::Transaction) -> Value {
 ///
 /// Every row gets all three whether or not its token is known: Tera errors on a
 /// missing map key, so one unknown token would take the page down.
-fn enrich_balance_changes(state: &AppState, changes: &mut [Value]) {
-    let mut token_addrs: Vec<String> = changes
-        .iter()
-        .filter_map(|c| c.get("token").and_then(Value::as_str).map(String::from))
-        .filter(|a| !a.is_empty())
-        .collect();
-    token_addrs.dedup();
-    let metas = db::get_tokens_metadata(&state.db, &token_addrs);
-
+fn enrich_balance_changes(
+    metas: &HashMap<String, crate::models::TokenMetadata>,
+    changes: &mut [Value],
+) {
     for change in changes.iter_mut() {
         let raw = change
             .get("change")
@@ -1212,6 +1197,7 @@ fn apply_replay_outcomes(calls: &mut [Value], outcomes: &[Option<String>]) {
 async fn resolve_call_statuses(
     state: &AppState,
     tx: &crate::models::Transaction,
+    parsed: &ParsedTx,
     calls: &mut [Value],
     mut fail_reason: Option<String>,
 ) -> Option<String> {
@@ -1223,7 +1209,7 @@ async fn resolve_call_statuses(
                 .map(String::from);
         }
         if fail_reason.is_none() {
-            let outcomes = replay_tx_calls(&state.rpc, tx).await;
+            let outcomes = replay_tx_calls(&state.rpc, tx, parsed).await;
             fail_reason = outcomes.iter().find_map(|o| o.clone());
             apply_replay_outcomes(calls, &outcomes);
         }
@@ -1251,20 +1237,12 @@ async fn resolve_call_statuses(
 }
 
 /// The gas, fee and identity fields of a transaction, as context keys.
-///
-/// All of it is parsed from the canonical RLP encoding at render time rather
-/// than stored per column, so this is where the transaction page pays for the
-/// columns the schema does not carry.
 fn gas_and_fee_ctx(
-    state: &AppState,
     tx: &crate::models::Transaction,
+    parsed: &ParsedTx,
+    fee_token_meta: Option<&crate::models::TokenMetadata>,
     receipt: Option<&Value>,
 ) -> Value {
-    let parsed = tx
-        .raw
-        .as_deref()
-        .map(crate::decoder::parse_raw_tx)
-        .unwrap_or_default();
     let gas_price = receipt
         .and_then(|r| r.get("effectiveGasPrice").and_then(Value::as_str))
         .map(parse_hex_i64)
@@ -1285,11 +1263,7 @@ fn gas_and_fee_ctx(
     } else {
         String::new()
     };
-    let fee_token_meta = tx
-        .fee_token
-        .as_deref()
-        .and_then(|f| db::get_token_metadata(&state.db, f));
-    let fee_breakdown = fee_breakdown(tx, gas_used, gas_price, fee_token_meta.as_ref());
+    let fee_breakdown = fee_breakdown(tx, gas_used, gas_price, fee_token_meta);
     json!({
         "gas_price": gas_price,
         "gas_used": gas_used,
@@ -1323,12 +1297,18 @@ pub async fn tx_page(
         .receipt_data
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok());
-    let trace: Option<Vec<Value>> = match tx
+    // The columns the schema does not carry, read from the RLP once.
+    let parsed = tx
+        .raw
+        .as_deref()
+        .map(crate::decoder::parse_raw_tx)
+        .unwrap_or_default();
+    let trace: Option<Arc<Vec<Value>>> = match tx
         .trace_data
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
     {
-        Some(trace) => Some(trace),
+        Some(trace) => Some(Arc::new(trace)),
         None => fetch_missing_trace(&state, &tx).await,
     };
     let block = db::get_block_by_number(&state.db, tx.block_number);
@@ -1345,7 +1325,7 @@ pub async fn tx_page(
         }
     }
 
-    let mut calls = extract_calls(&tx, trace.as_deref().unwrap_or(&[]));
+    let mut calls = extract_calls(&tx, &parsed, trace.as_deref().map_or(&[], Vec::as_slice));
     if calls.is_empty() {
         calls.push(top_level_call(&tx));
     }
@@ -1368,17 +1348,24 @@ pub async fn tx_page(
         .as_ref()
         .map(|r| extract_balance_changes(r, &tx))
         .unwrap_or_default();
-    enrich_balance_changes(&state, &mut balance_changes);
 
     // Metadata for every token the page mentions, so amounts read in the
     // token's own units rather than as raw integers. One batched query.
-    let token_display = token_display_map(
-        &state,
+    let metas = token_metas(
+        &state.db,
         decoded_events
             .iter()
             .flat_map(tokens_mentioned)
+            .chain(
+                balance_changes
+                    .iter()
+                    .filter_map(|c| c.get("token").and_then(Value::as_str).map(String::from)),
+            )
             .chain(tx.fee_token.clone()),
     );
+    enrich_balance_changes(&metas, &mut balance_changes);
+    let token_display = token_display_map(&metas);
+    let fee_token_meta = tx.fee_token.as_deref().and_then(|f| metas.get(f));
 
     let mut method = tx_method_badge(&tx.input);
     if method.is_none() {
@@ -1389,8 +1376,8 @@ pub async fn tx_page(
             .and_then(tx_method_badge);
     }
 
-    let (fee_payer, signature_type, fail_reason) = tx_extras(&tx, receipt.as_ref());
-    let fail_reason = resolve_call_statuses(&state, &tx, &mut calls, fail_reason).await;
+    let (fee_payer, signature_type, fail_reason) = tx_extras(&tx, &parsed, receipt.as_ref());
+    let fail_reason = resolve_call_statuses(&state, &tx, &parsed, &mut calls, fail_reason).await;
     decode_call_reverts(&mut calls);
 
     let failed_calls = calls
@@ -1418,14 +1405,17 @@ pub async fn tx_page(
         .collect();
 
     let mut extra = serde_json::Map::new();
-    merge_into(&mut extra, gas_and_fee_ctx(&state, &tx, receipt.as_ref()));
+    merge_into(
+        &mut extra,
+        gas_and_fee_ctx(&tx, &parsed, fee_token_meta, receipt.as_ref()),
+    );
     merge_into(
         &mut extra,
         json!({
             "tx": tx,
             "block": block,
             "receipt": receipt,
-            "trace": trace,
+            "trace": trace.as_deref(),
             "calls": calls,
             "events": events,
             "summary": summary,
@@ -1440,7 +1430,7 @@ pub async fn tx_page(
         }),
     );
     let ctx = page_ctx(&state, Value::Object(extra));
-    html_or_json(&state, &headers, &query, "tx.html", &ctx)
+    html_or_json(&state, &headers, &query, "tx.html", ctx)
 }
 
 pub async fn receipt_page(State(_state): State<AppState>, Path(tx_hash): Path<String>) -> Response {
@@ -1544,7 +1534,7 @@ pub async fn address_page(
             "active_tab": tab,
         }),
     );
-    html_or_json(&state, &headers, &query, "address.html", &ctx)
+    html_or_json(&state, &headers, &query, "address.html", ctx)
 }
 
 pub async fn token_page(
@@ -1635,7 +1625,7 @@ pub async fn token_page(
             "active_tab": tab,
         }),
     );
-    html_or_json(&state, &headers, &query, "token.html", &ctx)
+    html_or_json(&state, &headers, &query, "token.html", ctx)
 }
 
 pub async fn tokens_page(
@@ -1658,7 +1648,7 @@ pub async fn tokens_page(
             "per_page": per_page,
         }),
     );
-    html_or_json(&state, &headers, &query, "tokens.html", &ctx)
+    html_or_json(&state, &headers, &query, "tokens.html", ctx)
 }
 
 // ---------------------------------------------------------------------------
@@ -1698,7 +1688,7 @@ pub async fn anchoring_page(
             extra["address"] = json!(anchoring::ADDRESS);
             extra["q"] = json!(q);
             let ctx = page_ctx(&state, extra);
-            html_or_json(&state, &headers, &query, "anchoring.html", &ctx)
+            html_or_json(&state, &headers, &query, "anchoring.html", ctx)
         }
         Err(e) => node_failed(&state, &headers, &query, e),
     }
@@ -1733,7 +1723,7 @@ pub async fn anchoring_registry_page(
                     "events_more": events_more,
                 }),
             );
-            html_or_json(&state, &headers, &query, "anchoring_registry.html", &ctx)
+            html_or_json(&state, &headers, &query, "anchoring_registry.html", ctx)
         }
         Ok(None) => not_found(&state, &headers, &query, "Registry", &registry_id),
         Err(e) => node_failed(&state, &headers, &query, e),
@@ -1772,7 +1762,7 @@ pub async fn anchoring_record_page(
                     "total_pages": total_pages(latest.index as i64, PER_PAGE),
                 }),
             );
-            html_or_json(&state, &headers, &query, "anchoring_record.html", &ctx)
+            html_or_json(&state, &headers, &query, "anchoring_record.html", ctx)
         }
         Ok(None) => not_found(&state, &headers, &query, "Record", &id),
         Err(e) => node_failed(&state, &headers, &query, e),
@@ -1790,7 +1780,7 @@ fn node_failed(
     let page = if wants_json(headers, query) {
         Json(json!({"error": format!("{err:#}")})).into_response()
     } else {
-        render_html(&state.tera, "500.html", &page_ctx(state, json!({})))
+        render_html(&state.tera, "500.html", page_ctx(state, json!({})))
     };
     (StatusCode::BAD_GATEWAY, page).into_response()
 }
@@ -1892,7 +1882,7 @@ pub async fn search_page(
         return Redirect::to(&url).into_response();
     }
     let ctx = page_ctx(&state, json!({"query": q, "results": []}));
-    render_html(&state.tera, "search.html", &ctx)
+    render_html(&state.tera, "search.html", ctx)
 }
 
 /// Enough suggestions to be useful, few enough to read without scrolling.
@@ -2145,16 +2135,12 @@ fn not_found_html(state: &AppState, kind: &str, id: &str, message: &str) -> Resp
     // Through page_ctx like any other page: 404.html extends the layout, so a
     // hand-built context renders nothing and the reader gets bare text.
     let ctx = page_ctx(state, json!({"type": kind, "id": id, "message": message}));
-    match tera::Context::from_serialize(&ctx) {
-        Ok(tera_ctx) => match state.tera.render("404.html", &tera_ctx) {
-            Ok(html) => (StatusCode::NOT_FOUND, Html(html)).into_response(),
-            Err(e) => {
-                tracing::error!("404 template render failed: {e}");
-                (StatusCode::NOT_FOUND, Html(message.to_string())).into_response()
-            }
-        },
+    let rendered =
+        tera::Context::from_value(ctx).and_then(|ctx| state.tera.render("404.html", &ctx));
+    match rendered {
+        Ok(html) => (StatusCode::NOT_FOUND, Html(html)).into_response(),
         Err(e) => {
-            tracing::error!("404 context failed: {e}");
+            tracing::error!("404 template render failed: {e}");
             (StatusCode::NOT_FOUND, Html(message.to_string())).into_response()
         }
     }
