@@ -612,6 +612,17 @@ pub fn decode_function_call(data: &str) -> Option<DecodedCall> {
     })
 }
 
+/// A call's function name, else its selector, read from the selector alone.
+pub fn function_name(data: &str) -> Option<String> {
+    let selector_hex = data.strip_prefix("0x").unwrap_or(data).get(..8)?;
+    let mut selector = [0u8; 4];
+    hex::decode_to_slice(selector_hex, &mut selector).ok()?;
+    Some(match REGISTRY.function(&selector) {
+        Some((_, function)) => function.name.clone(),
+        None => format!("0x{}", hex::encode(selector)),
+    })
+}
+
 /// Decode calldata against a signature learned at runtime — what the 4-byte
 /// directory answers with. The signature is checked against the selector
 /// first, so a directory that answers with the wrong function names nothing.
@@ -1181,6 +1192,22 @@ mod tests {
         assert_eq!(event.params[3].name, "memo");
         assert_eq!(event.params[3].value, memo);
         assert!(event.params[3].indexed);
+    }
+
+    /// A row's badge comes from the selector alone, whatever follows it.
+    #[test]
+    fn a_listing_names_a_call_by_its_selector() {
+        let args = "00".repeat(64);
+        assert_eq!(
+            function_name(&format!("0xA9059CBB{args}")).as_deref(),
+            Some("transfer")
+        );
+        assert_eq!(
+            function_name(&format!("0xDEADBEEF{args}")).as_deref(),
+            Some("0xdeadbeef")
+        );
+        assert_eq!(function_name("0x"), None);
+        assert_eq!(function_name("0xa905"), None);
     }
 
     #[test]

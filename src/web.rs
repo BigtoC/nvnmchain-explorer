@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::extract::{Path, Query, State};
@@ -26,14 +26,14 @@ use tower_http::cors::CorsLayer;
 use crate::anchoring;
 use crate::config::Settings;
 use crate::contracts::{
-    abis_for_address, get_contract_name, get_precompile_name, identify_address, is_contract,
-    is_tip20_token, search_named,
+    abis_for_address, get_contract_name, get_precompile_name, identify_address, is_tip20_token,
+    search_named,
 };
 use crate::db::{self, Db, TxColumns};
 use crate::decoder::{
     checksum_address, decode_event, decode_function_call, decode_revert, decode_with_signature,
-    event_signature, extract_balance_changes, extract_calls, flatten_trace, function_signature,
-    keccak_hex, revert_data_in, DecodedEvent, ParsedTx, REGISTRY,
+    event_signature, extract_balance_changes, extract_calls, flatten_trace, function_name,
+    function_signature, keccak_hex, revert_data_in, DecodedEvent, ParsedTx, REGISTRY,
 };
 use crate::name_search;
 use crate::rpc::ChainRpc;
@@ -153,7 +153,7 @@ fn tx_row(t: &crate::models::Transaction) -> Value {
         "tx_timestamp": t.timestamp,
         "tx_status": t.status,
         "tx_block": t.block_number,
-        "tx_method": tx_method_badge(&t.input),
+        "tx_method": function_name(&t.input),
     })
 }
 
@@ -172,14 +172,6 @@ fn page_param(query: &HashMap<String, String>) -> u32 {
 /// Pages needed to show `total` rows, never fewer than one.
 fn total_pages(total: i64, per_page: u32) -> u32 {
     (total.max(0) as u64).div_ceil(u64::from(per_page)).max(1) as u32
-}
-
-/// Compact method badge for a transaction: decoded name > signature > selector.
-fn tx_method_badge(input: &str) -> Option<String> {
-    if input.is_empty() || input == "0x" {
-        return None;
-    }
-    decode_function_call(input).map(|d| d.name.or(d.signature).unwrap_or(d.selector))
 }
 
 /// Extra descriptors for the tx detail page, derived from the stored receipt
@@ -559,6 +551,33 @@ fn fee_breakdown(
     })
 }
 
+/// Labels by lowercase address, with when each was resolved.
+type Labels = Mutex<HashMap<String, (Option<String>, Instant)>>;
+
+/// How long a label is reused: a token indexed after its first look is tagged
+/// within this.
+const LABEL_TTL: Duration = Duration::from_secs(60);
+
+/// Labels held before the cache starts over.
+const MAX_LABELS: usize = 10_000;
+
+/// [`address_label`], reused for [`LABEL_TTL`].
+fn cached_label(labels: &Labels, db: &Db, address: &str) -> Option<String> {
+    let key = address.to_ascii_lowercase();
+    if let Some((label, asked)) = labels.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        if asked.elapsed() < LABEL_TTL {
+            return label.clone();
+        }
+    }
+    let label = address_label(db, address);
+    let mut held = labels.lock().unwrap_or_else(|e| e.into_inner());
+    if held.len() >= MAX_LABELS {
+        held.clear();
+    }
+    held.insert(key, (label.clone(), Instant::now()));
+    label
+}
+
 /// What to call an address, in the few characters a tag allows — the most
 /// specific name first: a precompile's own name, a token's symbol, an indexed
 /// contract label, that an address is a TIP-1022 forwarding alias.
@@ -641,8 +660,12 @@ pub async fn home(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let latest_block = db::get_latest_block(&state.db);
     let recent_blocks = db::get_recent_blocks(&state.db, state.cfg.recent_block_count);
+    // The tip is the newest of those, unless none are listed.
+    let latest_block = recent_blocks
+        .first()
+        .cloned()
+        .or_else(|| db::get_latest_block(&state.db));
     let recent_txs = db::get_transactions(&state.db, 1, state.cfg.recent_tx_count as u32);
     let latest_num = latest_block.as_ref().map(|b| b.number).unwrap_or(0);
     let mut stats = state
@@ -894,16 +917,15 @@ pub async fn block_page(
     let transactions =
         db::get_block_transactions(&state.db, block.number, columns_for(&headers, &query));
     let gas_pct = block_pct(block.gas_used, block.gas_limit);
-    let token_addrs: Vec<String> = transactions
-        .iter()
-        .filter_map(|t| t.fee_token.clone())
-        .collect();
-    let metas = db::get_tokens_metadata(&state.db, &token_addrs);
+    let metas = token_metas(
+        &state.db,
+        transactions.iter().filter_map(|t| t.fee_token.clone()),
+    );
     let transactions: Vec<Value> = transactions
         .iter()
         .map(|t| {
             let mut v = serde_json::to_value(t).unwrap_or(Value::Null);
-            if let Some(m) = tx_method_badge(&t.input) {
+            if let Some(m) = function_name(&t.input) {
                 v["method"] = json!(m);
             }
             if let Some(meta) = t.fee_token.as_deref().and_then(|f| metas.get(f)) {
@@ -918,12 +940,8 @@ pub async fn block_page(
         })
         .collect();
     let burnt = burnt_fees_wei(&block.base_fee, block.gas_used);
-    // Looked up rather than inferred from the tip: the index has gaps while it
-    // backfills, so a number below the tip is not necessarily there to link to.
-    let neighbour = |n: i64| db::get_block_by_number(&state.db, n).map(|b| b.number);
-    let previous = (block.number > 0)
-        .then(|| neighbour(block.number - 1))
-        .flatten();
+    let present = db::blocks_present(&state.db, &[block.number - 1, block.number + 1]);
+    let neighbour = |n: i64| present.contains(&n).then_some(n);
     let ctx = page_ctx(
         &state,
         json!({
@@ -932,7 +950,7 @@ pub async fn block_page(
             "gas_pct": gas_pct,
             "base_fee_gwei": format_token_amount(&block.base_fee, 9),
             "burnt_fees": burnt,
-            "previous_block": previous,
+            "previous_block": neighbour(block.number - 1),
             "next_block": neighbour(block.number + 1),
         }),
     );
@@ -1367,13 +1385,13 @@ pub async fn tx_page(
     let token_display = token_display_map(&metas);
     let fee_token_meta = tx.fee_token.as_deref().and_then(|f| metas.get(f));
 
-    let mut method = tx_method_badge(&tx.input);
+    let mut method = function_name(&tx.input);
     if method.is_none() {
         // Tempo-style txs have no top-level input; badge from the first call.
         method = calls
             .first()
             .and_then(|c| c.get("data").and_then(Value::as_str))
-            .and_then(tx_method_badge);
+            .and_then(function_name);
     }
 
     let (fee_payer, signature_type, fail_reason) = tx_extras(&tx, &parsed, receipt.as_ref());
@@ -1488,22 +1506,25 @@ pub async fn address_page(
     };
 
     // The Contract tab: the interface the explorer knows, the TIP-20 metadata
-    // when there is any, and the deployed bytecode. Only the code costs an RPC
-    // round trip, and only when that tab is open.
-    let interface = contract_interface(&checksummed);
-    let has_interface = interface["abis"].as_array().is_some_and(|a| !a.is_empty());
+    // when there is any, and the deployed bytecode. Other tabs need only
+    // whether there is an interface; JSON gets it on every tab.
+    let has_interface = !abis_for_address(&checksummed).is_empty();
+    let interface = if tab == "contract" || wants_json(&headers, &query) {
+        contract_interface(&checksummed)
+    } else {
+        Value::Null
+    };
 
     let addr_info = identify_address(&checksummed);
-    let is_token_addr = db::get_token_metadata(&state.db, &checksummed).is_some()
-        || crate::contracts::is_tip20_token(&checksummed);
-    let kind = if addr_info.kind == "eoa" && (is_contract(&checksummed) || is_token_addr) {
+    let token_meta = db::get_token_metadata(&state.db, &checksummed);
+    // An indexed token that identify_address does not know is a contract too.
+    let kind = if addr_info.kind == "eoa" && token_meta.is_some() {
         "contract"
     } else {
         addr_info.kind.as_str()
     };
     let label = addr_info.label.clone();
 
-    let token_meta = db::get_token_metadata(&state.db, &checksummed);
     let code = if tab == "contract" {
         contract_code(&state, &checksummed).await
     } else {
@@ -2191,15 +2212,14 @@ fn comma_num(n: i64) -> String {
 
 /// Attach token symbol/decimals + formatted amounts to transfer rows.
 fn enrich_transfers(state: &AppState, transfers: &mut [Value]) {
-    let addrs: Vec<String> = transfers
-        .iter()
-        .filter_map(|t| {
+    let metas = token_metas(
+        &state.db,
+        transfers.iter().filter_map(|t| {
             t.get("token_addr")
                 .and_then(Value::as_str)
                 .map(String::from)
-        })
-        .collect();
-    let metas = db::get_tokens_metadata(&state.db, &addrs);
+        }),
+    );
     for t in transfers.iter_mut() {
         let Some(addr) = t.get("token_addr").and_then(Value::as_str) else {
             continue;
@@ -2301,48 +2321,26 @@ pub fn build_tera(db: Db) -> Result<Arc<Tera>> {
         let ts = args.get("timestamp").and_then(Value::as_i64).unwrap_or(0);
         Ok(Value::String(format_time_ago(ts)))
     });
-    let block_db = db.clone();
-    tera.register_function("get_block_url", move |args: &HashMap<String, Value>| {
-        let id = args.get("block_id").and_then(Value::as_str).unwrap_or("");
-        let url = if id.chars().all(|c| c.is_ascii_digit()) && !id.is_empty() {
-            format!("/block/{id}")
-        } else {
-            db::get_block_by_hash(&block_db, id)
-                .map(|b| format!("/block/{}", b.number))
-                .unwrap_or_else(|| format!("/block/{id}"))
-        };
-        Ok(Value::String(url))
-    });
     tera.register_function("get_tx_url", |args: &HashMap<String, Value>| {
         let h = args.get("tx_hash").and_then(Value::as_str).unwrap_or("");
         Ok(Value::String(format!("/tx/{h}")))
     });
     tera.register_function("get_address_url", |args: &HashMap<String, Value>| {
         let a = args.get("address").and_then(Value::as_str).unwrap_or("");
-        let url = if is_valid_address(&checksum_address(a)) {
-            format!("/address/{}", checksum_address(a))
-        } else {
-            format!("/address/{a}")
-        };
-        Ok(Value::String(url))
+        Ok(Value::String(format!("/address/{}", checksum_address(a))))
     });
     // What the chain knows an address as, for the tag beside it.
-    let label_db = db;
+    let labels = Labels::default();
     tera.register_function("address_label", move |args: &HashMap<String, Value>| {
         let address = args.get("address").and_then(Value::as_str).unwrap_or("");
-        Ok(match address_label(&label_db, address) {
+        Ok(match cached_label(&labels, &db, address) {
             Some(label) => Value::String(label),
             None => Value::Null,
         })
     });
     tera.register_function("get_token_url", |args: &HashMap<String, Value>| {
         let a = args.get("address").and_then(Value::as_str).unwrap_or("");
-        let url = if is_valid_address(&checksum_address(a)) {
-            format!("/token/{}", checksum_address(a))
-        } else {
-            format!("/token/{a}")
-        };
-        Ok(Value::String(url))
+        Ok(Value::String(format!("/token/{}", checksum_address(a))))
     });
     tera.register_function("format_token_amount", |args: &HashMap<String, Value>| {
         let amount = args.get("amount").and_then(Value::as_str).unwrap_or("0");

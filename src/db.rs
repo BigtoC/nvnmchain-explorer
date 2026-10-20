@@ -574,6 +574,18 @@ pub fn get_block_by_number(db: &Db, number: i64) -> Option<Block> {
     )
 }
 
+/// Which of `numbers` are indexed: the index has gaps while it backfills.
+pub fn blocks_present(db: &Db, numbers: &[i64]) -> Vec<i64> {
+    let placeholders = vec!["?"; numbers.len()].join(",");
+    query_rows(
+        &lock(db),
+        "blocks_present",
+        &format!("SELECT number FROM blocks WHERE number IN ({placeholders})"),
+        rusqlite::params_from_iter(numbers),
+        |r| r.get(0),
+    )
+}
+
 pub fn get_block_by_hash(db: &Db, hash: &str) -> Option<Block> {
     query_opt(
         &lock(db),
