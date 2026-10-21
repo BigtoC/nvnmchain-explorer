@@ -499,29 +499,35 @@ pub fn save_block_bundles(db: &Db, bundles: &[BlockBundle]) -> Result<()> {
     }
     let mut conn = lock(db);
     let txn = conn.transaction().context("begin block batch")?;
+    let (mut blocks, mut txs) = (0, 0);
     for bundle in bundles {
-        write_block(&txn, bundle)?;
+        let (new_blocks, new_txs) = write_block(&txn, bundle)?;
+        blocks += new_blocks;
+        txs += new_txs;
     }
+    add_to_counter(&txn, "blocks", blocks)?;
+    add_to_counter(&txn, "transactions", txs)?;
     txn.commit().context("commit block batch")?;
     Ok(())
 }
 
-/// One block's worth of writes, inside a caller-owned transaction.
-fn write_block(txn: &Connection, bundle: &BlockBundle) -> Result<()> {
-    // What this write adds to the counters: a block already stored, and the
-    // transactions it already holds, are rewritten, not counted again.
+/// One block's writes, inside the caller's transaction. Returns the blocks and
+/// transactions it added: a rewrite counts neither the block nor what it held.
+fn write_block(txn: &Connection, bundle: &BlockBundle) -> Result<(i64, i64)> {
     let stored: i64 = txn
         .prepare_cached("SELECT EXISTS(SELECT 1 FROM blocks WHERE number=?1)")?
         .query_row(params![bundle.block.number], |r| r.get(0))?;
-    let held: i64 = txn
-        .prepare_cached("SELECT COUNT(*) FROM transactions WHERE block_number=?1")?
-        .query_row(params![bundle.block.number], |r| r.get(0))?;
+    // Most blocks hold no transaction to count.
+    let held: i64 = if bundle.txs.is_empty() {
+        0
+    } else {
+        txn.prepare_cached("SELECT COUNT(*) FROM transactions WHERE block_number=?1")?
+            .query_row(params![bundle.block.number], |r| r.get(0))?
+    };
     upsert_block(txn, &bundle.block)?;
     for tx in &bundle.txs {
         upsert_transaction(txn, tx)?;
     }
-    add_to_counter(txn, "blocks", 1 - stored)?;
-    add_to_counter(txn, "transactions", (bundle.txs.len() as i64 - held).max(0))?;
     // Transfers are keyed by (block_number, log_index): re-writing an
     // already-indexed block inserts nothing the second time, and only
     // freshly-inserted transfers move balances / holder counts.
@@ -540,7 +546,7 @@ fn write_block(txn: &Connection, bundle: &BlockBundle) -> Result<()> {
         upsert_token_meta(txn, meta)?;
     }
     apply_transfer_balances(txn, &inserted)?;
-    Ok(())
+    Ok((1 - stored, (bundle.txs.len() as i64 - held).max(0)))
 }
 
 fn row_to_block(row: &rusqlite::Row) -> rusqlite::Result<Block> {
@@ -1171,13 +1177,12 @@ fn adjust_balance(
     if delta.sign() == num_bigint::Sign::NoSign {
         return Ok(0);
     }
-    let current: Option<String> = query_opt(
-        conn,
-        "adjust_balance",
-        "SELECT balance FROM token_balances WHERE token_addr=?1 AND holder_addr=?2",
-        params![token, holder],
-        |r| r.get(0),
-    );
+    let current: Option<String> = conn
+        .prepare_cached(
+            "SELECT balance FROM token_balances WHERE token_addr=?1 AND holder_addr=?2",
+        )?
+        .query_row(params![token, holder], |r| r.get(0))
+        .optional()?;
     // A stored balance is a holding unless it is negative, as `HOLDING` reads it.
     let was_holding = current.as_deref().is_some_and(|b| !b.starts_with('-'));
     let new = bigint(current.as_deref().unwrap_or("0")) + delta;
@@ -1204,12 +1209,16 @@ fn adjust_balance(
 /// Move each token's balances by its transfers, and its holder count by what
 /// the balances did, rather than recounting the holders on every block.
 fn apply_transfer_balances(conn: &Connection, transfers: &[&TransferEvent]) -> Result<()> {
-    let mut moved: HashMap<&str, i64> = HashMap::new();
+    // Netted per (token, holder): every transaction's fee lands on the fee manager's row.
+    let mut deltas: HashMap<(&str, &str), num_bigint::BigInt> = HashMap::new();
     for t in transfers {
         let amount = bigint(&t.amount);
-        let holders = adjust_balance(conn, &t.token_addr, &t.from_addr, &-&amount)?
-            + adjust_balance(conn, &t.token_addr, &t.to_addr, &amount)?;
-        *moved.entry(t.token_addr.as_str()).or_default() += holders;
+        *deltas.entry((&t.token_addr, &t.from_addr)).or_default() -= &amount;
+        *deltas.entry((&t.token_addr, &t.to_addr)).or_default() += amount;
+    }
+    let mut moved: HashMap<&str, i64> = HashMap::new();
+    for ((token, holder), delta) in &deltas {
+        *moved.entry(token).or_default() += adjust_balance(conn, token, holder, delta)?;
     }
     add_to_holder_counts(conn, moved)
 }
