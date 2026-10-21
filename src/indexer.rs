@@ -114,7 +114,6 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
             continue;
         }
         let mut tx = parse_transaction(tx_data, &block);
-        tx.timestamp = block.timestamp;
         // Re-encode the RPC object with the official tempo primitives; the
         // block already carries the signed tx, so no extra per-tx RPC. Read in
         // place: a copy of every transaction object per block adds up.
@@ -768,18 +767,6 @@ impl Indexer {
         out
     }
 
-    /// `fetch_range` from `from`, cut at the first block that did not come back. What lies
-    /// above the hole is dropped and fetched again with it; nothing steps over a hole,
-    /// since neither loop ever comes back for one.
-    async fn fetch_from(&self, from: u64, to: u64) -> Vec<BlockBundle> {
-        contiguous_from(self.fetch_range(from, to).await, from)
-    }
-
-    /// `fetch_range` up to `to`, cut at the first block below it that did not come back.
-    async fn fetch_down_to(&self, from: u64, to: u64) -> Vec<BlockBundle> {
-        contiguous_down_to(self.fetch_range(from, to).await, to)
-    }
-
     async fn send_bundles(&self, bundles: impl IntoIterator<Item = BlockBundle>) -> bool {
         for b in bundles {
             if self.bundle_tx.send(b).await.is_err() {
@@ -889,7 +876,8 @@ async fn forward_loop(mut ix: Indexer) {
             db::set_chain_head(&ix.db, head as i64);
             let end = sent.saturating_add(ix.cfg.batch).min(head);
             ix.set_tip_lag(head.saturating_sub(sent));
-            let bundles = ix.fetch_from(sent + 1, end).await;
+            // Cut at the first hole: this loop never comes back for one.
+            let bundles = contiguous_from(ix.fetch_range(sent + 1, end).await, sent + 1);
             // Nothing past `sent` came back: the fetch failed, or the node has
             // not caught up with the head it announced. Ask again after a
             // moment; stepping over the block would leave a hole for good.
@@ -954,7 +942,7 @@ async fn backfill_loop(mut ix: Indexer) {
         let start = target.saturating_sub(ix.cfg.batch).max(1);
         // Cut at the first hole below the target: the frontier only descends,
         // so a block left above it would never be fetched again.
-        let bundles = ix.fetch_down_to(start, target - 1).await;
+        let bundles = contiguous_down_to(ix.fetch_range(start, target - 1).await, target - 1);
         if bundles.is_empty() {
             consecutive_failures += 1;
             let backoff = Duration::from_millis(200 * consecutive_failures.min(10) as u64);

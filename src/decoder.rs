@@ -1024,14 +1024,6 @@ pub fn extract_calls(tx: &Transaction, parsed: &ParsedTx, trace: &[Value]) -> Ve
     calls
 }
 
-pub fn parse_decimal_or_hex(s: &str) -> i128 {
-    if let Some(h) = s.strip_prefix("0x") {
-        i128::from_str_radix(h, 16).unwrap_or(0)
-    } else {
-        s.parse().unwrap_or(0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

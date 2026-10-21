@@ -41,16 +41,9 @@ pub struct TokenMeta {
 /// A few non-standard contracts return the string in place (length in word 0),
 /// so that shape is accepted as a fallback.
 pub fn decode_string_result(raw: &str) -> String {
-    if raw.is_empty() || raw == "0x" {
+    let Some(bytes) = abi_words(raw) else {
         return String::new();
-    }
-    let bytes = match hex::decode(raw.strip_prefix("0x").unwrap_or(raw)) {
-        Ok(b) => b,
-        Err(_) => return String::new(),
     };
-    if bytes.len() < 32 {
-        return String::new();
-    }
     let offset = u64::from_be_bytes(bytes[24..32].try_into().unwrap_or([0; 8])) as usize;
     // Standard dynamic-string encoding: the first word is an offset into the
     // buffer pointing at the length word, followed by the payload.
@@ -67,32 +60,23 @@ pub fn decode_string_result(raw: &str) -> String {
     String::from_utf8_lossy(&bytes[32..32 + len]).into_owned()
 }
 
+/// A call's return data as bytes, if it holds at least one ABI word.
+fn abi_words(raw: &str) -> Option<Vec<u8>> {
+    let bytes = hex::decode(raw.strip_prefix("0x").unwrap_or(raw)).ok()?;
+    (bytes.len() >= 32).then_some(bytes)
+}
+
 fn decode_uint_result(raw: &str, default: i64) -> i64 {
-    if raw.is_empty() || raw == "0x" {
-        return default;
-    }
-    let bytes = match hex::decode(raw.strip_prefix("0x").unwrap_or(raw)) {
-        Ok(b) => b,
-        Err(_) => return default,
-    };
-    if bytes.len() < 32 {
-        return default;
-    }
-    u64::from_be_bytes(bytes[24..32].try_into().unwrap_or([0; 8])) as i64
+    abi_words(raw).map_or(default, |bytes| {
+        u64::from_be_bytes(bytes[24..32].try_into().unwrap_or([0; 8])) as i64
+    })
 }
 
 fn decode_uint256_result(raw: &str) -> String {
-    if raw.is_empty() || raw == "0x" {
-        return "0".into();
-    }
-    let bytes = match hex::decode(raw.strip_prefix("0x").unwrap_or(raw)) {
-        Ok(b) => b,
-        Err(_) => return "0".into(),
-    };
-    if bytes.len() < 32 {
-        return "0".into();
-    }
-    num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes).to_string()
+    abi_words(raw).map_or_else(
+        || "0".into(),
+        |bytes| num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes).to_string(),
+    )
 }
 
 /// Clean a decoded `name()`/`symbol()` string. Real token metadata is
@@ -261,11 +245,6 @@ pub fn format_token_amount_with_symbol(amount: &str, decimals: i64, symbol: &str
     } else {
         format!("{formatted} {symbol}")
     }
-}
-
-/// Convenience JSON wrapper for the token page.
-pub fn token_to_json(meta: &TokenMeta) -> serde_json::Value {
-    json!(meta)
 }
 
 #[cfg(test)]

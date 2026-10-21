@@ -101,14 +101,8 @@ fn rpc_url() -> String {
         .unwrap_or_else(|_| DEFAULT_RPC_URL.to_string())
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
-    env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_usize(key: &str, default: usize) -> usize {
+/// `key` parsed as a `T`, or `default` when it is unset or does not parse.
+fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
     env::var(key)
         .ok()
         .and_then(|v| v.trim().parse().ok())
@@ -128,7 +122,7 @@ impl Settings {
     /// Every number is clamped to a usable range here, where it is read, so the
     /// rest of the explorer can build a `Duration` or a window from one as it is.
     pub fn from_env() -> Self {
-        let port = env_u64("PORT", DEFAULT_PORT.into());
+        let port: u64 = env_parse("PORT", DEFAULT_PORT.into());
         Self {
             role: role(),
             rpc_url: rpc_url(),
@@ -136,19 +130,19 @@ impl Settings {
             index_ws: env::var("INDEX_WS")
                 .map(|v| v != "0" && v.to_lowercase() != "false")
                 .unwrap_or(false),
-            chain_id: env_u64("CHAIN_ID", DEFAULT_CHAIN_ID),
+            chain_id: env_parse("CHAIN_ID", DEFAULT_CHAIN_ID),
             host: env_or("HOST", "0.0.0.0"),
             port: u16::try_from(port).unwrap_or_else(|_| {
                 tracing::warn!("PORT {port} is not a port number; listening on {DEFAULT_PORT}");
                 DEFAULT_PORT
             }),
             db_path: env_or("DB_PATH", "explorer.db"),
-            recent_block_count: env_usize("RECENT_BLOCK_COUNT", 15),
-            recent_tx_count: env_usize("RECENT_TX_COUNT", 15),
+            recent_block_count: env_parse("RECENT_BLOCK_COUNT", 15),
+            recent_tx_count: env_parse("RECENT_TX_COUNT", 15),
             poll_seconds: env_f64("INDEX_POLL_SECONDS", 1.0).clamp(0.05, 3600.0),
             // A window is fetched whole before it is written, so this bounds memory too.
-            batch_size: env_u64("INDEX_BATCH", 32).clamp(1, 1024),
-            index_concurrency: env_usize("INDEX_CONCURRENCY", 32).clamp(1, 256),
+            batch_size: env_parse("INDEX_BATCH", 32).clamp(1, 1024),
+            index_concurrency: env_parse("INDEX_CONCURRENCY", 32).clamp(1, 256),
             native_symbol: env_or("NATIVE_SYMBOL", "NVNM"),
             stats_interval_seconds: env_f64("STATS_INTERVAL_SECONDS", 5.0).clamp(1.0, 3600.0),
             signature_lookup_url: signature_lookup_url(),

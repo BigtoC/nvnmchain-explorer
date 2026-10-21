@@ -278,34 +278,9 @@ impl ChainRpc {
         hex_to_u64(&result).context("invalid eth_chainId result")
     }
 
-    pub async fn eth_gas_price(&self) -> Result<u64> {
-        let result = self.call("eth_gasPrice", json!([])).await?;
-        hex_to_u64(&result).context("invalid eth_gasPrice result")
-    }
-
     pub async fn eth_get_block_by_number(&self, num: u64, full: bool) -> Result<Option<Value>> {
         let result = self
             .call("eth_getBlockByNumber", json!([format!("0x{num:x}"), full]))
-            .await?;
-        if result.is_null() {
-            Ok(None)
-        } else {
-            Ok(Some(result))
-        }
-    }
-
-    pub async fn eth_get_block_by_hash(&self, hash: &str, full: bool) -> Result<Option<Value>> {
-        let result = self.call("eth_getBlockByHash", json!([hash, full])).await?;
-        if result.is_null() {
-            Ok(None)
-        } else {
-            Ok(Some(result))
-        }
-    }
-
-    pub async fn eth_get_transaction_receipt(&self, tx_hash: &str) -> Result<Option<Value>> {
-        let result = self
-            .call("eth_getTransactionReceipt", json!([tx_hash]))
             .await?;
         if result.is_null() {
             Ok(None)
@@ -353,23 +328,6 @@ impl ChainRpc {
         Ok(Some(receipts))
     }
 
-    pub async fn eth_get_transaction_by_hash(&self, tx_hash: &str) -> Result<Option<Value>> {
-        let result = self
-            .call("eth_getTransactionByHash", json!([tx_hash]))
-            .await?;
-        if result.is_null() {
-            Ok(None)
-        } else {
-            Ok(Some(result))
-        }
-    }
-
-    pub async fn eth_get_balance(&self, address: &str, block: &str) -> Result<String> {
-        let result = self.call("eth_getBalance", json!([address, block])).await?;
-        Ok(decimal_amount(&result))
-    }
-
-    #[allow(dead_code)]
     pub async fn eth_get_code(&self, address: &str, block: &str) -> Result<String> {
         let result = self.call("eth_getCode", json!([address, block])).await?;
         Ok(result
@@ -382,30 +340,6 @@ impl ChainRpc {
     pub async fn eth_get_logs(&self, filter: Value) -> Result<Vec<Value>> {
         let result = self.call("eth_getLogs", json!([filter])).await?;
         Ok(result.as_array().cloned().unwrap_or_default())
-    }
-
-    pub async fn eth_get_transaction_count(&self, address: &str, block: &str) -> Result<u64> {
-        let result = self
-            .call("eth_getTransactionCount", json!([address, block]))
-            .await?;
-        hex_to_u64(&result).context("invalid eth_getTransactionCount result")
-    }
-
-    pub async fn eth_fee_history(
-        &self,
-        block_count: u64,
-        newest_block: &str,
-        reward_percentiles: Vec<f64>,
-    ) -> Result<Value> {
-        self.call(
-            "eth_feeHistory",
-            json!([
-                format!("0x{block_count:x}"),
-                newest_block,
-                reward_percentiles
-            ]),
-        )
-        .await
     }
 
     pub async fn eth_get_storage_at(
@@ -433,27 +367,6 @@ impl ChainRpc {
             json!([tx_hash, {"tracer": "callTracer"}]),
         )
         .await
-    }
-
-    /// Trace a transaction with the callTracer; `None` when tracing is
-    /// unavailable. Not on the index path — kept for debugging.
-    pub async fn debug_trace_transaction(&self, tx_hash: &str) -> Option<Value> {
-        self.try_debug_trace_transaction(tx_hash)
-            .await
-            .ok()
-            .filter(|v| !v.is_null())
-    }
-
-    /// Trace all transactions in a block with the callTracer. Not on the index
-    /// path — kept for debugging.
-    pub async fn debug_trace_block(&self, block_num: u64) -> Option<Value> {
-        self.call(
-            "debug_traceBlockByNumber",
-            json!([format!("0x{block_num:x}"), {"tracer": "callTracer"}]),
-        )
-        .await
-        .ok()
-        .filter(|v| !v.is_null())
     }
 }
 
@@ -538,21 +451,6 @@ pub fn str_field(value: &Value, key: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string()
-}
-
-/// Resolve a block reference `"latest"`/number to a concrete height,
-/// falling back to the head.
-pub async fn resolve_block_ref(rpc: &ChainRpc, reference: &str) -> Result<Option<u64>> {
-    if reference == "latest" || reference == "pending" || reference == "earliest" {
-        return Ok(Some(rpc.eth_block_number().await?));
-    }
-    let s = reference.strip_prefix("0x").unwrap_or(reference);
-    match u64::from_str_radix(s, 16) {
-        Ok(n) => Ok(Some(n)),
-        Err(_) => {
-            bail!("invalid block reference: {reference}")
-        }
-    }
 }
 
 #[cfg(test)]

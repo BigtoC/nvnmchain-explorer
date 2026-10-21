@@ -765,9 +765,7 @@ fn row_to_tx(row: &rusqlite::Row) -> rusqlite::Result<Transaction> {
         fee_token: row.get::<_, Option<Vec<u8>>>(9)?.map(|b| blob_addr(&b)),
         fee_amount: row.get(10)?,
         input: row.get(11)?,
-        raw: row
-            .get::<_, Option<Vec<u8>>>(12)?
-            .map(|b| format!("0x{}", hex::encode(b))),
+        raw: row.get::<_, Option<Vec<u8>>>(12)?.map(|b| blob_hex(&b)),
         trace_data: row.get(13)?,
         receipt_data: row.get(14)?,
         timestamp: row.get(15)?,
@@ -1375,7 +1373,7 @@ pub fn rebuild_token_balances(conn: &Connection) -> Result<()> {
 /// keys stay comparable to the incremental path's writes.
 fn addr_from_value(v: ValueRef<'_>) -> String {
     let hex = match v {
-        ValueRef::Blob(b) => format!("0x{}", hex::encode(b)),
+        ValueRef::Blob(b) => blob_hex(b),
         ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
         _ => String::new(),
     };

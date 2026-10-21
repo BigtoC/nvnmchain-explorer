@@ -26,8 +26,7 @@ use tower_http::cors::CorsLayer;
 use crate::anchoring;
 use crate::config::Settings;
 use crate::contracts::{
-    abis_for_address, get_contract_name, get_precompile_name, identify_address, is_tip20_token,
-    search_named,
+    abis_for_address, get_contract_name, identify_address, is_tip20_token, search_named,
 };
 use crate::db::{self, Db, TxColumns};
 use crate::decoder::{
@@ -176,7 +175,7 @@ fn total_pages(total: i64, per_page: u32) -> u32 {
 
 /// Extra descriptors for the tx detail page, derived from the stored receipt
 /// and the raw RPC object: (fee payer, signature type, failure reason).
-pub fn tx_extras(
+fn tx_extras(
     tx: &crate::models::Transaction,
     parsed: &ParsedTx,
     receipt: Option<&Value>,
@@ -206,7 +205,7 @@ pub fn tx_extras(
 /// call (`None` = succeeded). This is the only per-call outcome source on
 /// chains whose receipts record no reason and whose tracing is unsupported.
 /// Entries are in `calls` order, skipping calls without a destination.
-pub async fn replay_tx_calls(
+async fn replay_tx_calls(
     rpc: &ChainRpc,
     tx: &crate::models::Transaction,
     parsed: &ParsedTx,
@@ -599,10 +598,7 @@ pub fn address_label(db: &Db, address: &str) -> Option<String> {
     if !is_valid_address(&checksummed) {
         return None;
     }
-    if let Some(name) = get_precompile_name(&checksummed) {
-        return Some(name);
-    }
-    if let Some(name) = crate::contracts::deployed_contract_name(&checksummed) {
+    if let Some(name) = get_contract_name(&checksummed) {
         return Some(name);
     }
     if let Some(meta) = db::get_token_metadata(db, &checksummed) {
@@ -1464,7 +1460,7 @@ pub async fn tx_page(
     html_or_json(&state, &headers, &query, "tx.html", ctx)
 }
 
-pub async fn receipt_page(State(_state): State<AppState>, Path(tx_hash): Path<String>) -> Response {
+pub async fn receipt_page(Path(tx_hash): Path<String>) -> Response {
     Redirect::to(&format!("/tx/{tx_hash}")).into_response()
 }
 
@@ -1818,12 +1814,15 @@ fn node_failed(
     err: anyhow::Error,
 ) -> Response {
     tracing::warn!("node read failed: {err:#}");
-    let page = if wants_json(headers, query) {
-        Json(json!({"error": format!("{err:#}")})).into_response()
-    } else {
-        render_html(&state.tera, "500.html", page_ctx(state, json!({})))
-    };
-    (StatusCode::BAD_GATEWAY, page).into_response()
+    error_response(
+        state,
+        headers,
+        query,
+        StatusCode::BAD_GATEWAY,
+        "500.html",
+        &format!("{err:#}"),
+        json!({}),
+    )
 }
 
 /// An address-shaped path segment that is not an address — a token, an
@@ -1835,15 +1834,15 @@ fn invalid_address(
     kind: &str,
     address: &str,
 ) -> Response {
-    if wants_json(headers, query) {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("Invalid address: {address}")})),
-        )
-            .into_response()
-    } else {
-        not_found_html(state, kind, address, "Invalid address")
-    }
+    error_response(
+        state,
+        headers,
+        query,
+        StatusCode::BAD_REQUEST,
+        "404.html",
+        &format!("Invalid address: {address}"),
+        json!({"type": kind, "id": address}),
+    )
 }
 
 /// One destination the search box can send the reader to.
@@ -2161,37 +2160,42 @@ fn not_found(
     kind: &str,
     id: &str,
 ) -> Response {
-    if wants_json(headers, query) {
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("{kind} not found")})),
-        )
-            .into_response()
-    } else {
-        not_found_html(state, kind, id, &format!("{kind} not found"))
-    }
+    error_response(
+        state,
+        headers,
+        query,
+        StatusCode::NOT_FOUND,
+        "404.html",
+        &format!("{kind} not found"),
+        json!({"type": kind, "id": id}),
+    )
 }
 
-fn not_found_html(state: &AppState, kind: &str, id: &str, message: &str) -> Response {
-    // Through page_ctx like any other page: 404.html extends the layout, so a
-    // hand-built context renders nothing and the reader gets bare text.
-    let ctx = page_ctx(state, json!({"type": kind, "id": id, "message": message}));
-    let rendered =
-        tera::Context::from_value(ctx).and_then(|ctx| state.tera.render("404.html", &ctx));
-    match rendered {
-        Ok(html) => (StatusCode::NOT_FOUND, Html(html)).into_response(),
-        Err(e) => {
-            tracing::error!("404 template render failed: {e}");
-            (StatusCode::NOT_FOUND, Html(message.to_string())).into_response()
-        }
-    }
+/// An error the way the client asked to hear it: `message` as JSON, or the
+/// page `template` renders over `extra`. Through page_ctx like any other page:
+/// the error pages extend the layout, so a bare context renders nothing.
+fn error_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: &HashMap<String, String>,
+    status: StatusCode,
+    template: &str,
+    message: &str,
+    extra: Value,
+) -> Response {
+    let body = if wants_json(headers, query) {
+        Json(json!({"error": message})).into_response()
+    } else {
+        render_html(&state.tera, template, page_ctx(state, extra))
+    };
+    (status, body).into_response()
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-pub use crate::decoder::{is_valid_address, truncate_hash};
+use crate::decoder::{is_valid_address, truncate_hash};
 
 fn parse_hex_i64(s: &str) -> i64 {
     if let Some(h) = s.strip_prefix("0x") {
@@ -2382,7 +2386,7 @@ pub fn build_tera(db: Db) -> Result<Arc<Tera>> {
     Ok(Arc::new(tera))
 }
 
-pub fn format_time_ago(ts: i64) -> String {
+fn format_time_ago(ts: i64) -> String {
     let now = chrono::Utc::now().timestamp();
     let diff = now - ts;
     if diff < 0 {

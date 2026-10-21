@@ -2,97 +2,160 @@
 
 use alloy_primitives::Address;
 use serde::Serialize;
-use std::collections::HashMap;
-use std::sync::OnceLock;
 use tempo_primitives::TempoAddressExt as _;
 
 use crate::decoder::checksum_address;
 
-fn precompile_labels() -> &'static HashMap<String, String> {
-    static MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        let pairs = [
-            ("0xfeEC000000000000000000000000000000000000", "Fee Manager"),
-            (
-                "0x403c000000000000000000000000000000000000",
-                "TIP-403 Registry",
-            ),
-            (
-                "0x20Fc000000000000000000000000000000000000",
-                "TIP-20 Factory",
-            ),
-            (
-                "0x4D50500000000000000000000000000000000000",
-                "TIP-20 Channel Reserve",
-            ),
-            (
-                "0xDEc0000000000000000000000000000000000000",
-                "Stablecoin DEX",
-            ),
-            (
-                "0x4e4F4E4345000000000000000000000000000000",
-                "Nonce Manager",
-            ),
-            (
-                "0xCccCcCCC00000000000000000000000000000000",
-                "Validator Config V1 (legacy)",
-            ),
-            (
-                "0xCccCcCCC00000000000000000000000000000001",
-                "Validator Config",
-            ),
-            (
-                "0xaAAAaaAA00000000000000000000000000000000",
-                "Account Keychain",
-            ),
-            (
-                "0xFDC0000000000000000000000000000000000000",
-                "Address Registry",
-            ),
-            (
-                "0x5165300000000000000000000000000000000000",
-                "Signature Verifier",
-            ),
-            (
-                "0xB10C000000000000000000000000000000000000",
-                "Receive Policy Guard",
-            ),
-            (
-                "0x1060000000000000000000000000000000000000",
-                "Storage Credits",
-            ),
-            (
-                "0xC077e00000000000000000000000000000000000",
-                "Current Committee",
-            ),
-            ("0x5AF2000000000000000000000000000000000000", "Zone Factory"),
-        ];
-        pairs
-            .iter()
-            .map(|(a, label)| (checksum_address(a), label.to_string()))
-            .collect()
-    })
+/// An address known by name, and the built-in ABIs that describe it. The fee
+/// manager has two: its own interface says nothing about the AMM it runs.
+struct Known {
+    address: &'static str,
+    label: &'static str,
+    /// `precompile`, or `contract` for an ordinary deployment at a fixed address.
+    kind: &'static str,
+    abis: &'static [&'static str],
 }
 
-/// Ordinary contracts at fixed addresses: canonical deployments, the anchoring contract and the
-/// zone portal implementation. Kept apart from the precompiles, which they are not.
-fn deployed_contracts() -> &'static HashMap<String, String> {
-    static MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        [
-            ("0xcA11bde05977b3631167028862bE2a173976CA11", "Multicall3"),
-            ("0x000000000022D473030F116dDEE9F6B43aC78BA3", "Permit2"),
-            ("0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed", "CreateX"),
-            ("0x0000000000000000000000000000000000000a00", "Anchoring"),
-            (
-                "0x5AD1000000000000000000000000000000000000",
-                "Zone Portal Implementation",
-            ),
-        ]
-        .iter()
-        .map(|(a, label)| (checksum_address(a), label.to_string()))
-        .collect()
-    })
+const fn precompile(
+    address: &'static str,
+    label: &'static str,
+    abis: &'static [&'static str],
+) -> Known {
+    Known {
+        address,
+        label,
+        kind: "precompile",
+        abis,
+    }
+}
+
+const fn contract(
+    address: &'static str,
+    label: &'static str,
+    abis: &'static [&'static str],
+) -> Known {
+    Known {
+        address,
+        label,
+        kind: "contract",
+        abis,
+    }
+}
+
+/// Tempo's precompiles, then ordinary contracts at fixed addresses. Matched
+/// ignoring case.
+const KNOWN: &[Known] = &[
+    precompile(
+        "0xfeEC000000000000000000000000000000000000",
+        "Fee Manager",
+        &["fee_manager", "fee_amm"],
+    ),
+    precompile(
+        "0x403c000000000000000000000000000000000000",
+        "TIP-403 Registry",
+        &["tip403_registry"],
+    ),
+    precompile(
+        "0x20Fc000000000000000000000000000000000000",
+        "TIP-20 Factory",
+        &["tip20_factory"],
+    ),
+    precompile(
+        "0x4D50500000000000000000000000000000000000",
+        "TIP-20 Channel Reserve",
+        &["tip20_channel_reserve"],
+    ),
+    precompile(
+        "0xDEc0000000000000000000000000000000000000",
+        "Stablecoin DEX",
+        &["stablecoin_dex"],
+    ),
+    precompile(
+        "0x4e4F4E4345000000000000000000000000000000",
+        "Nonce Manager",
+        &["nonce"],
+    ),
+    precompile(
+        "0xCccCcCCC00000000000000000000000000000000",
+        "Validator Config V1 (legacy)",
+        &["validator_config"],
+    ),
+    precompile(
+        "0xCccCcCCC00000000000000000000000000000001",
+        "Validator Config",
+        &["validator_config_v2"],
+    ),
+    precompile(
+        "0xaAAAaaAA00000000000000000000000000000000",
+        "Account Keychain",
+        &["account_keychain"],
+    ),
+    precompile(
+        "0xFDC0000000000000000000000000000000000000",
+        "Address Registry",
+        &["address_registry"],
+    ),
+    precompile(
+        "0x5165300000000000000000000000000000000000",
+        "Signature Verifier",
+        &["signature_verifier"],
+    ),
+    precompile(
+        "0xB10C000000000000000000000000000000000000",
+        "Receive Policy Guard",
+        &["receive_policy_guard"],
+    ),
+    precompile(
+        "0x1060000000000000000000000000000000000000",
+        "Storage Credits",
+        &["storage_credits"],
+    ),
+    precompile(
+        "0xC077e00000000000000000000000000000000000",
+        "Current Committee",
+        &["current_committee"],
+    ),
+    precompile(
+        "0x5AF2000000000000000000000000000000000000",
+        "Zone Factory",
+        &["zone_factory"],
+    ),
+    contract(
+        "0xcA11bde05977b3631167028862bE2a173976CA11",
+        "Multicall3",
+        &["multicall3"],
+    ),
+    contract(
+        "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+        "Permit2",
+        &["permit2"],
+    ),
+    contract(
+        "0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed",
+        "CreateX",
+        &["createx"],
+    ),
+    contract(
+        "0x0000000000000000000000000000000000000a00",
+        "Anchoring",
+        &["anchoring"],
+    ),
+    contract(
+        "0x5AD1000000000000000000000000000000000000",
+        "Zone Portal Implementation",
+        &["zone_portal"],
+    ),
+];
+
+fn known(addr: &str) -> Option<&'static Known> {
+    let addr = addr.trim();
+    KNOWN.iter().find(|k| k.address.eq_ignore_ascii_case(addr))
+}
+
+/// The zone a portal address numbers, if it is one. The prefix alone, zone id
+/// 0, is no portal: ids start at 1.
+fn zone_portal_id(addr: &str) -> Option<u64> {
+    addr.trim().parse::<Address>().ok()?.zone_portal_id()
 }
 
 /// Tokens genesis puts at reserved addresses, spelled as metadata rows store
@@ -105,33 +168,18 @@ pub const RESERVED_TOKENS: [&str; 4] = [
 ];
 
 /// TIP-20 native token prefix: all StdTokens start with 0x20C000...
-pub const TIP20_TOKEN_PREFIX: &str = "0x20c0000000000000000";
-
-pub fn is_precompile_address(addr: &str) -> bool {
-    precompile_labels().contains_key(&checksum_address(addr))
-}
-
-pub fn get_precompile_name(addr: &str) -> Option<String> {
-    precompile_labels().get(&checksum_address(addr)).cloned()
-}
+const TIP20_TOKEN_PREFIX: &str = "0x20c0000000000000000";
 
 pub fn is_tip20_token(addr: &str) -> bool {
     addr.trim().to_lowercase().starts_with(TIP20_TOKEN_PREFIX)
 }
 
-pub fn is_contract(addr: &str) -> bool {
-    let checksummed = checksum_address(addr);
-    precompile_labels().contains_key(&checksummed)
-        || deployed_contract_name(addr).is_some()
-        || is_tip20_token(addr)
-}
-
+/// The name of a contract at a fixed address, or of the zone portal an address numbers.
 pub fn get_contract_name(addr: &str) -> Option<String> {
-    get_precompile_name(addr).or_else(|| deployed_contract_name(addr))
-}
-
-pub fn is_eoa(addr: &str) -> bool {
-    !is_contract(addr)
+    if let Some(k) = known(addr) {
+        return Some(k.label.to_string());
+    }
+    zone_portal_id(addr).map(|id| format!("Zone Portal #{id}"))
 }
 
 #[derive(Debug, Serialize)]
@@ -139,139 +187,33 @@ pub struct AddressInfo {
     #[serde(rename = "type")]
     pub kind: String,
     pub label: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub symbol: Option<String>,
 }
 
 pub fn identify_address(addr: &str) -> AddressInfo {
-    let checksummed = checksum_address(addr);
-    if let Some(label) = precompile_labels().get(&checksummed) {
-        return AddressInfo {
-            kind: "precompile".into(),
-            label: Some(label.clone()),
-            symbol: None,
-        };
-    }
-    if let Some(label) = deployed_contract_name(addr) {
-        return AddressInfo {
-            kind: "contract".into(),
-            label: Some(label),
-            symbol: None,
-        };
-    }
-    if is_tip20_token(&checksummed) {
-        return AddressInfo {
-            kind: "token".into(),
-            label: None,
-            symbol: None,
-        };
-    }
+    let label = get_contract_name(addr);
+    let kind = match known(addr) {
+        Some(k) => k.kind,
+        None if label.is_some() => "contract", // a zone portal
+        None if is_tip20_token(addr) => "token",
+        None => "eoa",
+    };
     AddressInfo {
-        kind: "eoa".into(),
-        label: None,
-        symbol: None,
+        kind: kind.into(),
+        label,
     }
-}
-
-/// The name of a contract at a fixed address, or of the zone portal an address numbers.
-pub fn deployed_contract_name(addr: &str) -> Option<String> {
-    let checksummed = checksum_address(addr);
-    if let Some(name) = deployed_contracts().get(&checksummed) {
-        return Some(name.clone());
-    }
-    let id = checksummed.parse::<Address>().ok()?.zone_portal_id()?;
-    Some(format!("Zone Portal #{id}"))
 }
 
 /// Which built-in ABIs describe the contract at `addr`, by the names the
-/// decoder's registry loads them under. Some addresses need more than one:
-/// the fee manager's interface says nothing about the AMM it runs.
+/// decoder's registry loads them under.
 pub fn abis_for_address(addr: &str) -> &'static [&'static str] {
-    /// Addresses spelled lowercase, so the table cannot disagree with EIP-55
-    /// over a character. Lookups normalize the same way.
-    const BY_ADDRESS: &[(&str, &[&str])] = &[
-        (
-            "0xfeec000000000000000000000000000000000000",
-            &["fee_manager", "fee_amm"],
-        ),
-        (
-            "0x403c000000000000000000000000000000000000",
-            &["tip403_registry"],
-        ),
-        (
-            "0x20fc000000000000000000000000000000000000",
-            &["tip20_factory"],
-        ),
-        (
-            "0x4d50500000000000000000000000000000000000",
-            &["tip20_channel_reserve"],
-        ),
-        (
-            "0xdec0000000000000000000000000000000000000",
-            &["stablecoin_dex"],
-        ),
-        ("0x4e4f4e4345000000000000000000000000000000", &["nonce"]),
-        (
-            "0xcccccccc00000000000000000000000000000000",
-            &["validator_config"],
-        ),
-        (
-            "0xcccccccc00000000000000000000000000000001",
-            &["validator_config_v2"],
-        ),
-        (
-            "0xaaaaaaaa00000000000000000000000000000000",
-            &["account_keychain"],
-        ),
-        (
-            "0xfdc0000000000000000000000000000000000000",
-            &["address_registry"],
-        ),
-        (
-            "0x5165300000000000000000000000000000000000",
-            &["signature_verifier"],
-        ),
-        (
-            "0xb10c000000000000000000000000000000000000",
-            &["receive_policy_guard"],
-        ),
-        (
-            "0x1060000000000000000000000000000000000000",
-            &["storage_credits"],
-        ),
-        (
-            "0xc077e00000000000000000000000000000000000",
-            &["current_committee"],
-        ),
-        (
-            "0x5af2000000000000000000000000000000000000",
-            &["zone_factory"],
-        ),
-        (
-            "0xca11bde05977b3631167028862be2a173976ca11",
-            &["multicall3"],
-        ),
-        ("0x000000000022d473030f116ddee9f6b43ac78ba3", &["permit2"]),
-        ("0xba5ed099633d3b313e4d5f7bdc1305d3c28ba5ed", &["createx"]),
-        ("0x0000000000000000000000000000000000000a00", &["anchoring"]),
-        (
-            "0x5ad1000000000000000000000000000000000000",
-            &["zone_portal"],
-        ),
-    ];
-
-    let lowered = addr.trim().to_lowercase();
-    if let Some((_, abis)) = BY_ADDRESS.iter().find(|(a, _)| *a == lowered) {
-        return abis;
+    if let Some(k) = known(addr) {
+        return k.abis;
     }
     // Every TIP-20 is the same interface at a different address.
-    if is_tip20_token(&lowered) {
+    if is_tip20_token(addr) {
         return &["tip20", "tip20_roles_auth"];
     }
-    if lowered
-        .parse::<Address>()
-        .is_ok_and(|a| a.zone_portal_id().is_some())
-    {
+    if zone_portal_id(addr).is_some() {
         return &["zone_portal"];
     }
     &[]
@@ -285,11 +227,10 @@ pub fn search_named(query: &str, limit: usize) -> Vec<(String, String)> {
     if query.len() < 2 {
         return Vec::new();
     }
-    let mut matches: Vec<(u8, String, String)> = precompile_labels()
+    let mut matches: Vec<(u8, &str, &str)> = KNOWN
         .iter()
-        .chain(deployed_contracts())
-        .filter_map(|(address, name)| {
-            let lowered = name.to_lowercase();
+        .filter_map(|k| {
+            let lowered = k.label.to_lowercase();
             let rank = if lowered == query {
                 0
             } else if lowered.starts_with(&query) {
@@ -299,14 +240,14 @@ pub fn search_named(query: &str, limit: usize) -> Vec<(String, String)> {
             } else {
                 return None;
             };
-            Some((rank, name.clone(), address.clone()))
+            Some((rank, k.label, k.address))
         })
         .collect();
     matches.sort();
     matches.truncate(limit);
     matches
         .into_iter()
-        .map(|(_, name, address)| (address, name))
+        .map(|(_, name, address)| (checksum_address(address), name.to_string()))
         .collect()
 }
 
@@ -314,23 +255,16 @@ pub fn search_named(query: &str, limit: usize) -> Vec<(String, String)> {
 mod tests {
     use super::*;
 
-    /// Every labelled address must have an ABI to show, and every ABI it
-    /// names must be one the registry actually loads.
+    /// Every ABI the table names must be one the registry actually loads.
     #[test]
-    fn the_abi_table_agrees_with_the_label_table() {
-        for label in precompile_labels()
-            .keys()
-            .chain(deployed_contracts().keys())
-        {
-            let abis = abis_for_address(label);
-            assert!(
-                !abis.is_empty(),
-                "{label} is labelled but has no ABI to show"
-            );
-            for name in abis {
+    fn every_named_abi_is_registered() {
+        for k in KNOWN {
+            assert!(!k.abis.is_empty(), "{} has no ABI to show", k.label);
+            for name in k.abis {
                 assert!(
                     crate::decoder::REGISTRY.contract(name).is_some(),
-                    "{label} names `{name}`, which the registry does not load"
+                    "{} names `{name}`, which the registry does not load",
+                    k.label
                 );
             }
         }
