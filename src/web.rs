@@ -335,6 +335,19 @@ async fn contract_code(state: &AppState, address: &str) -> Value {
     })
 }
 
+/// The type `code` gives an unlisted address, if any: an EIP-7702 delegation (`0xef0100` and an
+/// address) leaves it an account.
+fn kind_from_code(code: &Value) -> Option<&'static str> {
+    let hex = code["hex"].as_str()?.trim_start_matches("0x");
+    if hex.len() == 46 && hex.starts_with("ef0100") {
+        None
+    } else if code["is_precompile_marker"] == true {
+        Some("precompile")
+    } else {
+        Some("contract")
+    }
+}
+
 /// What an address exposes: the ABIs the explorer knows for it, split into
 /// reads and writes, plus its events. Empty for an unknown address.
 fn contract_interface(address: &str) -> Value {
@@ -1525,11 +1538,18 @@ pub async fn address_page(
     };
     let label = addr_info.label.clone();
 
-    let code = if tab == "contract" {
+    // Only the node knows an unlisted contract: a factory's deployment has no receipt naming it.
+    let code = if tab == "contract" || kind == "eoa" {
         contract_code(&state, &checksummed).await
     } else {
         Value::Null
     };
+    let kind = if kind == "eoa" {
+        kind_from_code(&code).unwrap_or(kind)
+    } else {
+        kind
+    };
+    let code = if tab == "contract" { code } else { Value::Null };
     let virtual_address = parse_virtual(&checksummed);
 
     let ctx = page_ctx(

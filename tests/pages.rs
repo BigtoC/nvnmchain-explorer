@@ -513,6 +513,56 @@ async fn a_token_the_index_has_not_met_is_shown_and_not_stored() {
     assert_eq!(get_json(&base, "/tokens?").await["total"], before);
 }
 
+/// A node whose `eth_getCode` answers from `codes`, and `0x` for any other address.
+async fn stub_code_node(codes: Vec<(&'static str, String)>) -> String {
+    use axum::{routing::post, Json, Router};
+
+    let handler = move |Json(call): Json<Value>| {
+        let code = codes
+            .iter()
+            .find(|(address, _)| call["params"][0] == *address)
+            .map_or("0x".to_string(), |(_, code)| code.clone());
+        async move { Json(json!({"jsonrpc": "2.0", "id": call["id"], "result": code})) }
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, Router::new().route("/", post(handler))).await;
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn an_unlisted_address_is_what_its_code_says() {
+    // Digits only: each address is its own checksum.
+    let contract = "0x7777777777777777777777777777777777777777";
+    let precompile = "0x8888888888888888888888888888888888888888";
+    let delegating = "0x9999999999999999999999999999999999999999";
+    let node = stub_code_node(vec![
+        (contract, "0x6080604052".into()),
+        (precompile, "0xef".into()),
+        (delegating, format!("0xef0100{}", "ab".repeat(20))),
+    ])
+    .await;
+    let (_dir, base, _indexer) = serve_beside_indexer(Value::Null, &node).await;
+
+    for (address, kind) in [
+        (contract, "contract"),
+        (precompile, "precompile"),
+        (delegating, "eoa"),
+        ("0x6666666666666666666666666666666666666666", "eoa"),
+    ] {
+        let page = get_json(&base, &format!("/address/{address}?")).await;
+        assert_eq!(page["type"], json!(kind), "{address}");
+        // The bytecode goes out on the Contract tab only.
+        assert_eq!(page["code"], Value::Null, "{address}");
+    }
+    let tab = get_json(&base, &format!("/address/{contract}?tab=contract")).await;
+    assert_eq!(tab["code"]["bytes"], json!(5));
+}
+
 /// The activity charts draw the stats' series, and are left out until the
 /// stats have one.
 #[tokio::test]
